@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { join } from "node:path";
 import type { LazyProxyConfig } from "../config/schema";
 import { IdleTracker } from "./idle";
 import { ensureBinary } from "./download";
@@ -25,7 +26,8 @@ const FAIL_PAUSE_MS = 300_000;
 const START_TIMEOUT_MS = 15_000;
 
 function spawnMihomo(binary: string, dataDir: string): SpawnedProcess {
-  const child = spawn(binary, ["-d", dataDir], { stdio: "ignore", windowsHide: true });
+  const configPath = join(dataDir, "config.yaml");
+  const child = spawn(binary, ["-f", configPath, "-d", dataDir], { stdio: "ignore", windowsHide: true });
   return {
     pid: child.pid ?? 0,
     onExit: (l) => child.once("exit", l),
