@@ -60,23 +60,38 @@ export function buildMihomoConfig(cfg: LazyProxyConfig, nodes: ProxyNode[]): str
   if (nodes.length === 0) {
     throw new SubscriptionError("cannot build config without proxies");
   }
-  const names = nodes.map((n) => n.name);
+  let usable = nodes;
+  if (cfg.excludeNodes) {
+    try {
+      const re = new RegExp(cfg.excludeNodes);
+      usable = usable.filter((n) => !re.test(n.name));
+    } catch {
+      /* 非法正则忽略 */
+    }
+  }
+  if (usable.length === 0) {
+    throw new SubscriptionError("all proxies excluded by excludeNodes");
+  }
+  const names = usable.map((n) => n.name);
+  const pin = cfg.pinNode && names.includes(cfg.pinNode) ? cfg.pinNode : undefined;
   const config = {
     "mixed-port": cfg.corePort,
     "bind-address": "127.0.0.1",
     mode: "rule",
     "log-level": "warning",
-    proxies: nodes,
-    "proxy-groups": [
-      { name: "PROXY", type: "select", proxies: ["AUTO", ...names] },
-      {
-        name: "AUTO",
-        type: "url-test",
-        proxies: names,
-        url: "http://www.gstatic.com/generate_204",
-        interval: 300,
-      },
-    ],
+    proxies: usable,
+    "proxy-groups": pin
+      ? [{ name: "PROXY", type: "select", proxies: [pin] }]
+      : [
+          { name: "PROXY", type: "select", proxies: ["AUTO", ...names] },
+          {
+            name: "AUTO",
+            type: "url-test",
+            proxies: names,
+            url: "http://www.gstatic.com/generate_204",
+            interval: 300,
+          },
+        ],
     rules: ["MATCH,PROXY"],
   };
   return dump(config, { noRefs: true, lineWidth: 200 });

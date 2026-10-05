@@ -35,6 +35,9 @@ export function validateConfig(raw: unknown): LazyProxyConfig {
       typeof r.subscriptionFile === "string" && r.subscriptionFile.trim()
         ? r.subscriptionFile.trim()
         : undefined,
+    excludeNodes:
+      typeof r.excludeNodes === "string" && r.excludeNodes.trim() ? r.excludeNodes.trim() : undefined,
+    pinNode: typeof r.pinNode === "string" && r.pinNode.trim() ? r.pinNode.trim() : undefined,
     corePath: typeof r.corePath === "string" && r.corePath.trim() ? r.corePath.trim() : undefined,
     downloadBaseUrl:
       typeof r.downloadBaseUrl === "string" && r.downloadBaseUrl.trim()

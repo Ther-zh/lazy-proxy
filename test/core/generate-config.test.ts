@@ -92,6 +92,36 @@ describe("buildMihomoConfig", () => {
   it("throws with zero nodes", () => {
     expect(() => buildMihomoConfig(cfg, [])).toThrow(/without proxies/);
   });
+
+  it("excludeNodes filters nodes from AUTO", () => {
+    const nodes = extractProxies(FIXTURE);
+    const yaml = buildMihomoConfig({ ...cfg, excludeNodes: "hk|tw" }, nodes);
+    const doc = load(yaml) as { "proxy-groups": Array<{ name: string; proxies: string[] }> };
+    const auto = doc["proxy-groups"].find((g) => g.name === "AUTO");
+    expect(auto?.proxies.every((p) => !p.includes("HK") && !p.includes("TW"))).toBe(true);
+    expect(auto?.proxies).toContain("JP-01");
+  });
+
+  it("pinNode pins PROXY and drops AUTO", () => {
+    const nodes = extractProxies(FIXTURE);
+    const yaml = buildMihomoConfig({ ...cfg, pinNode: "JP-01" }, nodes);
+    const doc = load(yaml) as { "proxy-groups": Array<{ name: string; type: string; proxies: string[] }> };
+    const groups = doc["proxy-groups"];
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ name: "PROXY", type: "select", proxies: ["JP-01"] });
+  });
+
+  it("invalid pinNode falls back to AUTO", () => {
+    const nodes = extractProxies(FIXTURE);
+    const yaml = buildMihomoConfig({ ...cfg, pinNode: "不存在的节点" }, nodes);
+    const doc = load(yaml) as { "proxy-groups": Array<{ name: string }> };
+    expect(doc["proxy-groups"].map((g) => g.name)).toEqual(["PROXY", "AUTO"]);
+  });
+
+  it("throws when excludeNodes removes everything", () => {
+    const nodes = extractProxies(FIXTURE);
+    expect(() => buildMihomoConfig({ ...cfg, excludeNodes: "." }, nodes)).toThrow(/excluded/);
+  });
 });
 
 describe("loadSubscriptionSource", () => {

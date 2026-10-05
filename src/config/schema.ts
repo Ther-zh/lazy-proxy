@@ -3,6 +3,10 @@ export interface LazyProxyConfig {
   subscriptionUrl: string;
   /** 本地订阅文件路径（存在时优先于 subscriptionUrl，避免订阅端点不可达） */
   subscriptionFile?: string;
+  /** 排除节点正则（如 hk|tw）；命中名称的节点不进 AUTO/PROXY 组 */
+  excludeNodes?: string;
+  /** 钉死使用指定节点（精确节点名，最高优先） */
+  pinNode?: string;
   /** opencode 插件 shim 监听端口 */
   shimPort: number;
   /** mihomo mixed-port */
