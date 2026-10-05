@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-4o-mini",
+  "provider": {
+    "openai": {
+      "options": {
+        "baseURL": "http://127.0.0.1:17999/v1",
+        "apiKey": "spike-key-123"
+      }
+    }
+  }
+}
