@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { load } from "js-yaml";
@@ -8,6 +8,7 @@ import {
   ensureConfig,
   extractProxies,
   fetchSubscription,
+  loadSubscriptionSource,
   SubscriptionError,
   type Fetcher,
 } from "../../src/core/generate-config";
@@ -90,6 +91,26 @@ describe("buildMihomoConfig", () => {
   });
   it("throws with zero nodes", () => {
     expect(() => buildMihomoConfig(cfg, [])).toThrow(/without proxies/);
+  });
+});
+
+describe("loadSubscriptionSource", () => {
+  it("reads local file when subscriptionFile set (no network)", async () => {
+    const dir = tempDir();
+    const file = join(dir, "sub.yml");
+    writeFileSync(file, FIXTURE, "utf8");
+    const raw = await loadSubscriptionSource({ ...cfg, subscriptionFile: file });
+    expect(raw).toContain("proxies:");
+    rmSync(dir, { recursive: true, force: true });
+  });
+  it("throws when file missing", async () => {
+    await expect(loadSubscriptionSource({ ...cfg, subscriptionFile: "C:/nope.yml" })).rejects.toThrow(
+      /read subscription file failed/,
+    );
+  });
+  it("falls back to fetch when no file", async () => {
+    const fetcher = (async () => new Response("proxies: []", { status: 200 })) as Fetcher;
+    await expect(loadSubscriptionSource(cfg, fetcher)).resolves.toBe("proxies: []");
   });
 });
 

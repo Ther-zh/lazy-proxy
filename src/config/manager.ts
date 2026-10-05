@@ -31,6 +31,10 @@ export function validateConfig(raw: unknown): LazyProxyConfig {
     shimPort: num(r.shimPort, DEFAULTS.shimPort),
     corePort: num(r.corePort, DEFAULTS.corePort),
     idleMs: num(r.idleMs, DEFAULTS.idleMs),
+    subscriptionFile:
+      typeof r.subscriptionFile === "string" && r.subscriptionFile.trim()
+        ? r.subscriptionFile.trim()
+        : undefined,
     corePath: typeof r.corePath === "string" && r.corePath.trim() ? r.corePath.trim() : undefined,
     downloadBaseUrl:
       typeof r.downloadBaseUrl === "string" && r.downloadBaseUrl.trim()

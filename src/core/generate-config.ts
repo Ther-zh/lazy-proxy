@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dump, load } from "js-yaml";
 import type { LazyProxyConfig } from "../config/schema";
@@ -82,13 +82,28 @@ export function buildMihomoConfig(cfg: LazyProxyConfig, nodes: ProxyNode[]): str
   return dump(config, { noRefs: true, lineWidth: 200 });
 }
 
+/** 获取订阅原始内容：本地文件优先，否则网络抓取 */
+export async function loadSubscriptionSource(
+  cfg: Pick<LazyProxyConfig, "subscriptionUrl" | "subscriptionFile">,
+  fetcher: Fetcher = fetch,
+): Promise<string> {
+  if (cfg.subscriptionFile) {
+    try {
+      return readFileSync(cfg.subscriptionFile, "utf8");
+    } catch (e) {
+      throw new SubscriptionError(`read subscription file failed: ${(e as Error).message}`);
+    }
+  }
+  return fetchSubscription(cfg.subscriptionUrl, fetcher);
+}
+
 /** 抓取订阅 → 生成 config.yaml → 写入 dataDir，返回文件路径 */
 export async function ensureConfig(
   dataDir: string,
   cfg: LazyProxyConfig,
   fetcher: Fetcher = fetch,
 ): Promise<string> {
-  const raw = await fetchSubscription(cfg.subscriptionUrl, fetcher);
+  const raw = await loadSubscriptionSource(cfg, fetcher);
   const nodes = extractProxies(raw);
   const yaml = buildMihomoConfig(cfg, nodes);
   const p = join(dataDir, "config.yaml");

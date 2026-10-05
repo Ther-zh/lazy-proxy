@@ -1,6 +1,8 @@
 export interface LazyProxyConfig {
   /** 机场 Clash/mihomo 格式订阅 URL（含 token） */
   subscriptionUrl: string;
+  /** 本地订阅文件路径（存在时优先于 subscriptionUrl，避免订阅端点不可达） */
+  subscriptionFile?: string;
   /** opencode 插件 shim 监听端口 */
   shimPort: number;
   /** mihomo mixed-port */
