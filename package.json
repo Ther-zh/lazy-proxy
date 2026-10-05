@@ -1,0 +1,21 @@
+{
+  "name": "lazy-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/plugin/index.ts --bundle --outfile=dist/plugin.js --format=esm --platform=node --target=esnext --external:node:* --external:bun:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/js-yaml": "^4.0.9",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "js-yaml": "^5.4.2"
+  }
+}
