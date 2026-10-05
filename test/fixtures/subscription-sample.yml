@@ -1,0 +1,11 @@
+# minimal subscription sample (mirrors real airport output shape)
+mixed-port: 7890
+proxies:
+  - { name: '⚠️ 过滤掉2条线路（升级客户端）', type: ss, server: edge.example.com, port: 10001, cipher: aes-128-gcm, password: 'p1', udp: true, plugin: obfs, plugin-opts: { mode: http, host: fake.baidu.com } }
+  - { name: 'HK-01', type: ss, server: edge.example.com, port: 10002, cipher: aes-128-gcm, password: 'p1', udp: true, plugin: obfs, plugin-opts: { mode: http, host: fake.baidu.com } }
+  - { name: 'JP-01', type: ss, server: edge.example.com, port: 10009, cipher: aes-128-gcm, password: 'p1', udp: true, plugin: obfs, plugin-opts: { mode: http, host: fake.baidu.com } }
+  - { name: 'US-01', type: ss, server: edge.example.com, port: 10008, cipher: aes-128-gcm, password: 'p1', udp: true, plugin: obfs, plugin-opts: { mode: http, host: fake.baidu.com } }
+proxy-groups:
+  - { name: manual, type: select, proxies: [auto, 'HK-01', 'JP-01', 'US-01'] }
+rules:
+  - 'DOMAIN-KEYWORD,example,DIRECT'
