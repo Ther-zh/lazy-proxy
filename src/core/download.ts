@@ -51,13 +51,32 @@ export function unzipArchive(zipPath: string, destDir: string): void {
   }
 }
 
+/** Windows 兜底下载：Bun fetch 连不上 GitHub CDN 时用 PowerShell 原生下载 */
+export async function downloadViaPowershell(url: string, dest: string): Promise<void> {
+  const r = spawnSync(
+    "powershell",
+    ["-NoProfile", "-NonInteractive", "-Command", `Invoke-WebRequest -UseBasicParsing -Uri '${url}' -OutFile '${dest}'`],
+    { encoding: "utf8", timeout: 180_000 },
+  );
+  if (r.status !== 0) {
+    throw new Error(`powershell download failed: ${(r.stderr ?? r.stdout ?? "").trim()}`);
+  }
+}
+
 export interface BinaryDeps {
   fetcher: Fetcher;
   unzip: (zip: string, dest: string) => void;
   sha256: (p: string) => string;
+  /** 可选：fetch 失败后的原生下载兜底（测试不注入则直接抛错） */
+  powerShellDownload?: (url: string, dest: string) => Promise<void>;
 }
 
-const defaultDeps: BinaryDeps = { fetcher: fetch, unzip: unzipArchive, sha256: sha256OfFile };
+const defaultDeps: BinaryDeps = {
+  fetcher: fetch,
+  unzip: unzipArchive,
+  sha256: sha256OfFile,
+  powerShellDownload: downloadViaPowershell,
+};
 
 /**
  * 确保 mihomo 二进制可用：
@@ -83,7 +102,15 @@ export async function ensureBinary(
   mkdirSync(binDir, { recursive: true });
   const url = buildDownloadUrl(cfg);
   const tmpZip = join(binDir, `${version}.zip`);
-  await downloadToFile(url, tmpZip, deps.fetcher);
+  try {
+    await downloadToFile(url, tmpZip, deps.fetcher);
+  } catch (e) {
+    if (deps.powerShellDownload) {
+      await deps.powerShellDownload(url, tmpZip);
+    } else {
+      throw e;
+    }
+  }
 
   const hash = deps.sha256(tmpZip);
   const rec = join(binDir, `mihomo-${version}.sha256`);

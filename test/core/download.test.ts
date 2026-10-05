@@ -115,6 +115,17 @@ describe("ensureBinary", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("falls back to powerShellDownload when fetch fails", async () => {
+    const dir = tempDir();
+    const data = join(dir, "data");
+    const psDownload = async (_url: string, dest: string) => writeFileSync(dest, FAKE_EXE);
+    const p = await ensureBinary(data, cfg, deps({ fetcher: (async () => {
+      throw new Error("bun fetch blocked");
+    }) as never, powerShellDownload: psDownload }));
+    expect(p).toBe(join(data, "bin", "mihomo-v1.19.32.exe"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("throws when mihomo.exe missing in archive", async () => {
     const dir = tempDir();
     const data = join(dir, "data");
