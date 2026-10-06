@@ -63,7 +63,7 @@ export function buildMihomoConfig(cfg: LazyProxyConfig, nodes: ProxyNode[]): str
   let usable = nodes;
   if (cfg.excludeNodes) {
     try {
-      const re = new RegExp(cfg.excludeNodes);
+      const re = new RegExp(cfg.excludeNodes, "i");
       usable = usable.filter((n) => !re.test(n.name));
     } catch {
       /* 非法正则忽略 */
