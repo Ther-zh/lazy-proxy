@@ -1,30 +1,5 @@
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../config/manager";
-import { CoreManager, defaultCoreDeps } from "../core/manager";
-import { startShimServer } from "../shim/server";
-
-export function resolveConfigDir(): string {
-  const override = process.env.LAZYPROXY_CONFIG_DIR;
-  if (override && override.trim()) return override.trim();
-  return join(homedir(), ".config", "lazyproxy");
-}
-
-export interface LazyProxyHandle {
-  port: number;
-  close: () => void;
-}
-
-/** 装配核心管理器 + shim 服务器；未配置订阅时返回 null（不抛错，避免拖垮 opencode） */
-export function startLazyProxy(cfgDir: string): LazyProxyHandle | null {
-  const cfg = loadConfig(cfgDir);
-  if (!cfg.subscriptionUrl) return null;
-  const dataDir = join(cfgDir, "data");
-  mkdirSync(dataDir, { recursive: true });
-  const core = new CoreManager(cfg, dataDir, defaultCoreDeps());
-  return startShimServer(cfg, core);
-}
+import { resolveConfigDir, startLazyProxy } from "./runtime";
 
 interface PluginCtx {
   client?: {
@@ -36,7 +11,14 @@ interface PluginCtx {
   };
 }
 
-/** opencode 插件入口：启动懒代理；任何失败只记日志，绝不影响 opencode 本体 */
+/**
+ * opencode 插件入口：启动懒代理；任何失败只记日志，绝不影响 opencode 本体。
+ *
+ * 重要：本文件只导出这一个插件函数。opencode 会把插件文件里导出的
+ * 每一个函数都当作插件加载，若此处 re-export 了 resolveConfigDir /
+ * startLazyProxy 等辅助函数，加载器会将其当作插件调用并崩溃
+ * （Cannot read properties of undefined (reading '_client')），导致整个插件文件加载失败。
+ */
 export const LazyProxyPlugin = async (ctx: PluginCtx): Promise<Record<string, unknown>> => {
   const log = (level: string, message: string) => {
     const fn = ctx?.client?.app?.log;

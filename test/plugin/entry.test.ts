@@ -2,7 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { LazyProxyPlugin, resolveConfigDir, startLazyProxy } from "../../src/plugin/index";
+import { LazyProxyPlugin } from "../../src/plugin/index";
+import { resolveConfigDir, startLazyProxy } from "../../src/plugin/runtime";
 
 describe("plugin entry", () => {
   it("exports an async plugin function", () => {
