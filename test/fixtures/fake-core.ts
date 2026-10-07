@@ -1,84 +1,73 @@
-/** 测试用假"核心代理"：TCP 监听，把绝对形式 HTTP/1.1 请求转发到目标主机。 */
+/** 测试用假"核心代理"：TCP 监听。
+ *  - CONNECT host:port → 回 200 后进入隧道模式（echo，模拟已建立的上游隧道）；
+ *  - 绝对形式 HTTP/1.1 → 直连目标并双向透传。 */
+import { createServer as createTcpServer, connect as netConnect } from "node:net";
 
-function pipe(socketA: any, socketB: any) {
-  return {
-    data(_s: any, b: Uint8Array) {
-      socketB.write(b);
-    },
-    close() {
-      try {
-        socketB.end();
-      } catch {
-        /* noop */
-      }
-    },
-    error() {
-      try {
-        socketB.end();
-      } catch {
-        /* noop */
-      }
-    },
-  };
+export interface FakeCoreHandle {
+  port: number;
+  hits: () => number;
+  connectHits: () => number;
+  stop: () => void;
 }
 
-export function startFakeCoreProxy(port: number): Promise<{ port: number; hits: () => number; stop: () => void }> {
-  return new Promise((resolve) => {
-    let hits = 0;
-    const server = Bun.listen({
-      hostname: "127.0.0.1",
-      port,
-      socket: {
-        open(s: any) {
-          s.data = { buffer: "" };
-        },
-        data(socket: any, buf: Uint8Array) {
-          const d = socket.data;
-          d.buffer += new TextDecoder("latin1").decode(buf);
-          const idx = d.buffer.indexOf("\r\n\r\n");
-          if (idx === -1) return;
-          const head = d.buffer.slice(0, idx);
-          const rest = d.buffer.slice(idx + 4);
-          d.buffer = "";
-          const firstLine = head.split("\r\n")[0];
-          const [method, url] = firstLine.split(" ");
-          hits++;
-          let u: URL;
-          try {
-            u = new URL(url);
-          } catch {
-            try {
-              socket.end();
-            } catch {
-              /* noop */
-            }
-            return;
-          }
-          Bun.connect({ hostname: u.hostname, port: Number(u.port || 80), socket: pipe(socket, socket) })
-            .then((up: any) => {
-              d.up = up;
-              up.write(head + "\r\n\r\n" + rest);
-            })
-            .catch(() => {
-              try {
-                socket.end();
-              } catch {
-                /* noop */
-              }
-            });
-        },
-        close(socket: any) {
-          try {
-            socket.data?.up?.end?.();
-          } catch {
-            /* noop */
-          }
-        },
-        error() {
-          /* noop */
-        },
-      },
+export function startFakeCoreProxy(port: number): Promise<FakeCoreHandle> {
+  let hits = 0;
+  let connectHits = 0;
+  const server = createTcpServer((socket) => {
+    let buf = Buffer.alloc(0);
+    let mode: "head" | "tunnel" | "http" = "head";
+    socket.on("error", () => {
+      /* noop */
     });
-    resolve({ port: server.port!, hits: () => hits, stop: () => server.stop() });
+    socket.on("data", (chunk: string | Buffer) => {
+      const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      if (mode === "tunnel") {
+        socket.write(data);
+        return;
+      }
+      if (mode === "http") return;
+      buf = Buffer.concat([buf, data]);
+      const idx = buf.indexOf("\r\n\r\n");
+      if (idx === -1) return;
+      const head = buf.subarray(0, idx).toString("latin1");
+      const rest = buf.subarray(idx + 4);
+      const [method, url] = head.split("\r\n")[0].split(" ");
+      hits++;
+      if (method === "CONNECT") {
+        mode = "tunnel";
+        connectHits++;
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (rest.length) socket.write(rest);
+        return;
+      }
+      let u: URL;
+      try {
+        u = new URL(url);
+      } catch {
+        socket.end();
+        return;
+      }
+      mode = "http";
+      const up = netConnect({ host: u.hostname, port: Number(u.port || 80) }, () => {
+        up.write(head + "\r\n\r\n");
+        if (rest.length) up.write(rest);
+        up.pipe(socket);
+        socket.pipe(up);
+      });
+      up.on("error", () => socket.destroy());
+      socket.on("close", () => up.destroy());
+    });
+  });
+  return new Promise<FakeCoreHandle>((resolve) => {
+    server.listen(port, "127.0.0.1", () => {
+      const addr = server.address();
+      const actual = typeof addr === "object" && addr !== null ? addr.port : port;
+      resolve({
+        port: actual,
+        hits: () => hits,
+        connectHits: () => connectHits,
+        stop: () => server.close(),
+      });
+    });
   });
 }

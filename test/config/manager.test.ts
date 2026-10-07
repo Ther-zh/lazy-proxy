@@ -47,6 +47,17 @@ describe("validateConfig", () => {
     expect(c.corePath).toBe("C:\\x\\mihomo.exe");
     expect(c.downloadBaseUrl).toBe("https://mirror");
   });
+
+  it("parses proxyHosts (trim/lowercase/dedupe) and falls back to defaults", () => {
+    const c1 = validateConfig({
+      ...valid,
+      proxyHosts: [" ChatGPT.com ", "api.openai.com", "chatgpt.com", 42, ""],
+    });
+    expect(c1.proxyHosts).toEqual(["chatgpt.com", "api.openai.com"]);
+    expect(validateConfig({ ...valid }).proxyHosts).toEqual([...DEFAULTS.proxyHosts]);
+    expect(validateConfig({ ...valid, proxyHosts: [] }).proxyHosts).toEqual([...DEFAULTS.proxyHosts]);
+    expect(validateConfig({ ...valid, proxyHosts: "x" }).proxyHosts).toEqual([...DEFAULTS.proxyHosts]);
+  });
 });
 
 describe("loadConfig", () => {

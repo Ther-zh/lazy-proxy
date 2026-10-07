@@ -21,8 +21,12 @@ export interface LazyProxyConfig {
   mihomoVersion: string;
   /** 上游 OpenAI-compatible 基地址 */
   upstream: string;
+  /** 需要经内核代理的域名（后缀匹配，如 chatgpt.com 覆盖 *.chatgpt.com）；其余域名直连。缺省时用 DEFAULTS.proxyHosts */
+  proxyHosts?: string[];
   logLevel: "debug" | "info" | "warn" | "error";
 }
+
+export const DEFAULT_PROXY_HOSTS = ["chatgpt.com", "openai.com"] as const;
 
 export const DEFAULTS = {
   shimPort: 17891,
@@ -30,6 +34,7 @@ export const DEFAULTS = {
   idleMs: 180_000,
   mihomoVersion: "v1.19.32",
   upstream: "https://api.openai.com",
+  proxyHosts: [...DEFAULT_PROXY_HOSTS],
   logLevel: "info",
 } as const;
 

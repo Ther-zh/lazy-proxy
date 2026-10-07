@@ -1,9 +1,10 @@
+import { createServer as createHttpServer } from "node:http";
 import { describe, expect, it } from "vitest";
 import { startShimServer } from "../../src/shim/server";
 import { CoreManager } from "../../src/core/manager";
 import type { LazyProxyConfig } from "../../src/config/schema";
-import { startFakeCoreProxy } from "../fixtures/fake-core";
 import { DEFAULTS } from "../../src/config/schema";
+import { startFakeCoreProxy } from "../fixtures/fake-core";
 
 const cfgOf = (over: Partial<LazyProxyConfig>): LazyProxyConfig => ({
   subscriptionUrl: "https://sub.example.com/api?token=x",
@@ -12,6 +13,7 @@ const cfgOf = (over: Partial<LazyProxyConfig>): LazyProxyConfig => ({
   idleMs: 180_000,
   mihomoVersion: DEFAULTS.mihomoVersion,
   upstream: "https://api.openai.com",
+  proxyHosts: [...DEFAULTS.proxyHosts],
   logLevel: "info",
   ...over,
 });
@@ -29,36 +31,41 @@ function readyCore(): CoreManager {
   return core;
 }
 
-/** 假上游：OpenAI 风格回显 + SSE 流 */
+/** 假上游：OpenAI 风格回显 + SSE 流（node:http） */
 async function startUpstream(): Promise<{ port: number; lastAuth: () => string | null; stop: () => void }> {
   let auth: string | null = null;
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(req) {
-      auth = req.headers.get("authorization");
-      const u = new URL(req.url);
-      if (u.pathname === "/v1/stream") {
-        const stream = new ReadableStream<Uint8Array>({
-          async start(c) {
-            const t = new TextEncoder();
-            c.enqueue(t.encode(`data: {"content":"event1"}\n\n`));
-            await Bun.sleep(30);
-            c.enqueue(t.encode(`data: {"content":"event2"}\n\n`));
-            c.close();
-          },
-        });
-        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
-      }
-      return Response.json({
-        ok: true,
-        auth,
-        hasCustom: req.headers.get("x-custom"),
-        path: u.pathname,
-      });
-    },
+  const server = createHttpServer((req, res) => {
+    auth = req.headers["authorization"] ?? null;
+    const u = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (u.pathname === "/v1/stream") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: {"content":"event1"}\n\n`);
+      setTimeout(() => {
+        res.write(`data: {"content":"event2"}\n\n`);
+        res.end();
+      }, 30);
+      return;
+    }
+    const body = JSON.stringify({
+      ok: true,
+      auth,
+      hasCustom: req.headers["x-custom"] ?? null,
+      path: u.pathname,
+    });
+    res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+    res.end(body);
   });
-  return { port: server.port!, lastAuth: () => auth, stop: () => server.stop() };
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+  return {
+    port,
+    lastAuth: () => auth,
+    stop: () => {
+      (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+      server.close();
+    },
+  };
 }
 
 describe("shim server integration", () => {
@@ -74,7 +81,7 @@ describe("shim server integration", () => {
     core.onRequestEnd = () => {
       ends++;
     };
-    const shim = startShimServer(
+    const shim = await startShimServer(
       cfgOf({ corePort: coreProxy.port, upstream: `http://127.0.0.1:${up.port}` }),
       core,
     );
@@ -117,14 +124,17 @@ describe("shim server integration", () => {
   it("returns 502 and decrements when core cannot start", async () => {
     const up = await startUpstream();
     const coreProxy = await startFakeCoreProxy(0);
-    const broken: any = {
+    const broken = {
       ensureUp: async () => {
         throw new Error("core boom");
       },
       onRequestStart() {},
       onRequestEnd() {},
-    };
-    const shim = startShimServer(cfgOf({ corePort: coreProxy.port, upstream: `http://127.0.0.1:${up.port}` }), broken);
+    } as unknown as CoreManager;
+    const shim = await startShimServer(
+      cfgOf({ corePort: coreProxy.port, upstream: `http://127.0.0.1:${up.port}` }),
+      broken,
+    );
     const res = await fetch(`http://127.0.0.1:${shim.port}/v1/chat/completions`, {
       method: "POST",
       body: "{}",

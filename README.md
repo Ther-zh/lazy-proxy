@@ -20,7 +20,8 @@ opencode ──(HTTP)──> plugin shim 127.0.0.1:17891 ──> mihomo core 127
 
 - **Trigger**: the first request reaching the shim starts the core (auto-download if needed, generate a minimal `config.yaml` from your subscription).
 - **Idle**: after `idleMs` with no active connection, the core process is killed.
-- **Safety**: listens only on `127.0.0.1`; never touches system proxy / TUN / firewall.
+- **Safety**: listens only on `127.0.0.1`; never touches system proxy / TUN / firewall; **no system-level env vars are written**. OpenAI-bound traffic is intercepted **in-process**: the plugin patches `globalThis.fetch` (only hosts in `proxyHosts` are tunneled via the shim) and also injects proxy env inside the opencode process (gone when opencode exits); every other host and app stays untouched.
+- **Selective**: only hosts in `proxyHosts` (default `chatgpt.com` / `openai.com`) go through the core — all other traffic (other providers, other apps) passes through directly.
 - **External core**: if a core is already listening on `corePort`, it is reused and never killed.
 
 ---
@@ -70,6 +71,7 @@ Config file: **`~/.config/lazyproxy/config.json`** (or `$env:LAZYPROXY_CONFIG_DI
   "idleMs": 180000,              // idle shutdown, ms
   "mihomoVersion": "v1.19.32",   // core binary version to auto-download
   "upstream": "https://api.openai.com",  // default upstream for the shim
+  "proxyHosts": ["chatgpt.com", "openai.com"],  // domains routed through the core (suffix match); everything else passes through directly
   "logLevel": "info"
 }
 ```
@@ -105,12 +107,14 @@ The shim lazily starts the core on the first request, tunnels via your subscript
 
 ### B) Chat OAuth path (Chat Plus/Pro account)
 
-The Chat-OAuth flow talks to **chatgpt.com** (not `api.openai.com`), so:
+The Chat-OAuth flow talks to **chatgpt.com** (not `api.openai.com`). No manual proxy setup is needed:
 
 1. Keep `provider.openai.options.baseURL` **unset** (default).
-2. Run opencode with a proxy env pointing at the tunnel (e.g. `HTTPS_PROXY=http://127.0.0.1:<corePort>`, plus `NO_PROXY=localhost,127.0.0.1`), and keep the core running (`bun scripts/start-core.mjs`).
+2. On load, the plugin **patches `globalThis.fetch` inside the opencode process**: requests to `proxyHosts` hosts (e.g. `chatgpt.com`, `auth.openai.com`) are tunneled via `127.0.0.1:<shimPort>` (CONNECT), which lazily starts the core; every other URL goes to the original fetch untouched. Proxy env is also injected in-process as a belt-and-suspenders for env-reading libraries. This is required because the Desktop runtime's provider calls use Node's built-in `fetch` (undici), which ignores `HTTPS_PROXY` — only an in-process fetch patch can intercept them.
 3. Authenticate once via `/connect` → OpenAI → Chat Plus/Pro (browser).
 4. Use a model supported by Codex-with-Chat (e.g. `gpt-5.6-luna`); generic IDs like `gpt-4o-mini` are rejected.
+
+> Do **not** set a system/user-level `HTTPS_PROXY` — that hijacks every app on the machine (an earlier manual setup did exactly that and took the whole system down when the core died). The plugin scopes the proxy to the opencode process itself.
 
 ---
 

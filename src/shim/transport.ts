@@ -1,24 +1,32 @@
-/** 明文 TCP → 本地代理核心（mihomo mixed-port）：绝对形式 HTTP/1.1 + chunked 解码。 */
+import {
+  request as httpRequest,
+  type IncomingMessage,
+  type RequestOptions,
+  type ServerResponse,
+} from "node:http";
+import { request as httpsRequest } from "node:https";
 
+/** HTTP/1.1 逐跳头（不可透传） */
 export const HOP_BY_HOP = new Set([
   "connection",
   "keep-alive",
+  "proxy-connection",
   "proxy-authenticate",
   "proxy-authorization",
   "te",
   "trailer",
   "transfer-encoding",
   "upgrade",
-  "host",
-  "content-length",
 ]);
 
+/** 保留工具：解析 HTTP/1.1 状态行（供隧道握手与测试使用）。 */
 export function parseStatusLine(line: string): number {
   const m = /^HTTP\/1\.[01] (\d{3})/.exec(line);
   if (!m) throw new Error(`bad status line: ${line}`);
   return Number(m[1]);
 }
 
+/** 保留工具：解析头部行。 */
 export function parseHeaderLines(head: string): Array<[string, string]> {
   const lines = head.split("\r\n");
   const out: Array<[string, string]> = [];
@@ -30,7 +38,7 @@ export function parseHeaderLines(head: string): Array<[string, string]> {
   return out;
 }
 
-/** HTTP/1.1 chunked 解码器（逐段喂入，返回解出的数据片） */
+/** 保留工具：HTTP/1.1 chunked 解码器（逐段喂入，返回解出的数据片）。 */
 export class ChunkDecoder {
   done = false;
   private buf = Buffer.alloc(0);
@@ -91,132 +99,65 @@ export class ChunkDecoder {
 }
 
 export interface ForwardOptions {
-  corePort: number;
-  upstream: string;
-}
-
-/** 读取请求体（MVP 直接缓冲，保证 Content-Length 可算） */
-async function readBody(request: Request): Promise<Buffer | null> {
-  if (request.body === null) return null;
-  return Buffer.from(await request.arrayBuffer());
+  /** null → 直连目标；数字 → 以绝对形式 request-target 经 127.0.0.1:<corePort> 转发 */
+  corePort: number | null;
+  /** 目标绝对 URL */
+  targetUrl: string;
 }
 
 /**
- * 将 opencode 的请求经本地代理核心转发到上游。
- * 构造绝对形式 HTTP/1.1 请求写到核心 mixed-port，响应经 chunked 解码后
- * 以流式 Response 返回（SSE 保持流式）。
+ * 转发一个 HTTP 请求（流式）：经核心（mihomo mixed-port）或直连。
+ * node:http 客户端自动处理 chunked/content-length 与 SSE 流式。
  */
-export async function forwardViaCore(request: Request, opts: ForwardOptions): Promise<Response> {
-  const bodyBuf = await readBody(request);
-  const u = new URL(request.url);
-  const target = `${opts.upstream}${u.pathname}${u.search}`;
-  const host = new URL(opts.upstream).host;
-
-  const headLines: string[] = [`${request.method} ${target} HTTP/1.1`, `Host: ${host}`];
-  for (const [k, v] of request.headers) {
-    const lk = k.toLowerCase();
-    if (HOP_BY_HOP.has(lk)) continue;
-    headLines.push(`${k}: ${v}`);
+export function forwardRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: ForwardOptions,
+): Promise<void> {
+  const target = new URL(opts.targetUrl);
+  const headers: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v === undefined) continue;
+    if (HOP_BY_HOP.has(k.toLowerCase())) continue;
+    headers[k] = v;
   }
-  if (bodyBuf) headLines.push(`Content-Length: ${bodyBuf.length}`);
-  headLines.push("Connection: close");
-  const head = headLines.join("\r\n") + "\r\n\r\n";
+  headers["host"] = target.host;
 
-  let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
-  const stream = new ReadableStream<Uint8Array>({ start(c) { streamController = c; } });
+  const viaCore = opts.corePort !== null;
+  const send = (viaCore || target.protocol !== "https:" ? httpRequest : httpsRequest) as typeof httpRequest;
+  const requestOptions: RequestOptions = viaCore
+    ? { host: "127.0.0.1", port: opts.corePort ?? undefined, method: req.method, path: opts.targetUrl, headers, agent: false }
+    : {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === "https:" ? 443 : 80),
+        method: req.method,
+        path: `${target.pathname}${target.search}`,
+        headers,
+        agent: false,
+      };
 
-  const response = new Promise<Response>((resolve, reject) => {
-    let headBuf = Buffer.alloc(0);
-    let parsed: { status: number; headers: Headers; mode: "length" | "chunked" | "raw"; remaining: number } | null = null;
-    let decoder: ChunkDecoder | null = null;
-    let settled = false;
-
-    const fail = (err: unknown) => {
-      if (!settled) {
-        settled = true;
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    };
-
-    const feed = (chunk: Uint8Array) => {
-      if (!parsed || !streamController) return;
-      if (parsed.mode === "chunked") {
-        try {
-          decoder ??= new ChunkDecoder();
-          for (const piece of decoder.push(chunk)) streamController.enqueue(piece);
-          if (decoder.done) {
-            try { streamController.close(); } catch { /* already closed */ }
-          }
-        } catch (e) {
-          try { streamController.error(e); } catch { /* noop */ }
+  return new Promise<void>((resolve, reject) => {
+    const upstream = send(
+      requestOptions,
+      (upRes) => {
+        const outHeaders: Record<string, string | string[]> = {};
+        for (const [k, v] of Object.entries(upRes.headers)) {
+          if (v === undefined) continue;
+          if (HOP_BY_HOP.has(k.toLowerCase())) continue;
+          outHeaders[k] = v;
         }
-      } else if (parsed.mode === "length") {
-        const take = Math.min(chunk.length, parsed.remaining);
-        if (take > 0) streamController.enqueue(chunk.subarray(0, take));
-        parsed.remaining -= take;
-        if (parsed.remaining <= 0) {
-          try { streamController.close(); } catch { /* noop */ }
-        }
-      } else {
-        streamController.enqueue(chunk);
-      }
-    };
-
-    Bun.connect({
-      hostname: "127.0.0.1",
-      port: opts.corePort,
-      socket: {
-        open(s) {
-          s.write(head);
-          if (bodyBuf && bodyBuf.length) s.write(bodyBuf);
-          s.flush?.();
-        },
-        data(_s, buf) {
-          if (!parsed) {
-            headBuf = Buffer.concat([headBuf, buf]);
-            const idx = headBuf.indexOf("\r\n\r\n");
-            if (idx !== -1) {
-              const headStr = headBuf.subarray(0, idx).toString("latin1");
-              const rest = headBuf.subarray(idx + 4);
-              const status = parseStatusLine(headStr.split("\r\n")[0]);
-              const pairs = parseHeaderLines(headStr);
-              const headers = new Headers();
-              for (const [k, v] of pairs) {
-                const lk = k.toLowerCase();
-                if (["transfer-encoding", "content-length", "connection", "keep-alive", "trailer", "upgrade"].includes(lk)) continue;
-                headers.set(k, v);
-              }
-              const te = pairs.find(([k]) => k.toLowerCase() === "transfer-encoding")?.[1]?.toLowerCase() ?? "";
-              const clRaw = pairs.find(([k]) => k.toLowerCase() === "content-length")?.[1];
-              const mode: "length" | "chunked" | "raw" = te.includes("chunked") ? "chunked" : clRaw !== undefined ? "length" : "raw";
-              parsed = { status, headers, mode, remaining: mode === "length" ? Number(clRaw) : 0 };
-              if (!settled) {
-                settled = true;
-                resolve(new Response(stream, { status, headers }));
-              }
-              if (rest.length) feed(rest);
-            }
-            return;
-          }
-          feed(buf);
-        },
-        close() {
-          if (!parsed || !streamController) return;
-          if (parsed.mode === "raw") {
-            try { streamController.close(); } catch { /* noop */ }
-          } else if (parsed.mode === "length" && parsed.remaining > 0) {
-            try { streamController.error(new Error("premature close from upstream")); } catch { /* noop */ }
-          }
-        },
-        error(_s, err) {
-          fail(new Error(`core tunnel error: ${err}`));
-          try { streamController?.error(new Error("core tunnel error")); } catch { /* noop */ }
-        },
+        res.writeHead(upRes.statusCode ?? 502, outHeaders);
+        upRes.pipe(res);
+        upRes.on("end", () => resolve());
+        upRes.on("error", (e) => {
+          res.destroy();
+          reject(e);
+        });
       },
-    }).catch((e) => {
-      fail(e);
-    });
+    );
+    upstream.on("error", reject);
+    req.on("error", () => upstream.destroy());
+    req.pipe(upstream);
   });
-
-  return response;
 }

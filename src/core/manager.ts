@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { connect } from "node:net";
 import { join } from "node:path";
 import type { LazyProxyConfig } from "../config/schema";
 import { IdleTracker } from "./idle";
@@ -58,17 +59,20 @@ export async function tcpPortReady(port: number, timeoutMs: number): Promise<boo
 }
 
 async function tryConnect(port: number): Promise<boolean> {
-  try {
-    const s = await Bun.connect({
-      hostname: "127.0.0.1",
-      port,
-      socket: { open() {}, data() {}, close() {}, error() {} },
-    });
-    s.end();
-    return true;
-  } catch {
-    return false;
-  }
+  return new Promise<boolean>((resolve) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let settled = false;
+    const settle = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(1000, () => settle(false));
+    socket.once("connect", () => settle(true));
+    socket.once("error", () => settle(false));
+  });
 }
 
 export function defaultCoreDeps(): CoreManagerDeps {
