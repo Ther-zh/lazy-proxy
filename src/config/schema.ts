@@ -7,6 +7,16 @@ export interface LazyProxyConfig {
   excludeNodes?: string;
   /** 钉死使用指定节点（精确节点名，最高优先） */
   pinNode?: string;
+  /** 有序回退池（精确节点名）；设置后 PROXY 为 fallback [pin?, ...fallbackNodes] */
+  fallbackNodes?: string[];
+  /** fallback/url-test 健康检查 URL；默认 gstatic 204 */
+  healthCheckUrl?: string;
+  /** 隧道建立阶段失败时是否持续重试（直到调用方 abort）；默认 true */
+  retryForever?: boolean;
+  /** 首次重试延迟（毫秒）；默认 1000 */
+  retryDelayMs?: number;
+  /** 指数退避上限（毫秒）；默认 10000 */
+  retryMaxDelayMs?: number;
   /** opencode 插件 shim 监听端口 */
   shimPort: number;
   /** mihomo mixed-port */
@@ -27,6 +37,7 @@ export interface LazyProxyConfig {
 }
 
 export const DEFAULT_PROXY_HOSTS = ["chatgpt.com", "openai.com"] as const;
+export const DEFAULT_HEALTH_CHECK_URL = "http://www.gstatic.com/generate_204";
 
 export const DEFAULTS = {
   shimPort: 17891,
@@ -35,6 +46,10 @@ export const DEFAULTS = {
   mihomoVersion: "v1.19.32",
   upstream: "https://api.openai.com",
   proxyHosts: [...DEFAULT_PROXY_HOSTS],
+  healthCheckUrl: DEFAULT_HEALTH_CHECK_URL,
+  retryForever: true,
+  retryDelayMs: 1000,
+  retryMaxDelayMs: 10_000,
   logLevel: "info",
 } as const;
 

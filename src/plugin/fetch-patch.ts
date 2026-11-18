@@ -25,12 +25,36 @@ export interface FetchScope {
   fetch?: typeof fetch;
 }
 
+export interface FetchPatchTimeouts {
+  /** 等待 shim 回应 CONNECT 的超时（毫秒） */
+  connectMs?: number;
+  /** CONNECT 建立后等待 TLS 握手的超时（毫秒） */
+  tlsMs?: number;
+}
+
+/** CONNECT 阶段可能包含冷启动（首次甚至要下载 mihomo），保持与旧实现一致的 30s */
+export const DEFAULT_SHIM_CONNECT_TIMEOUT_MS = 30_000;
+export const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 25_000;
+
+export interface FetchRetryOptions {
+  /** 隧道建立阶段失败时持续重试，直到调用方 abort */
+  forever?: boolean;
+  /** 首次重试延迟（毫秒） */
+  delayMs?: number;
+  /** 指数退避上限（毫秒） */
+  maxDelayMs?: number;
+}
+
 export interface FetchPatchOptions {
   shimPort: number;
   hosts: readonly string[];
   scope?: FetchScope;
   /** 显式指定被包装的原始 fetch（默认取 scope.fetch） */
   originalFetch?: typeof fetch;
+  timeouts?: FetchPatchTimeouts;
+  retry?: FetchRetryOptions;
+  /** 重试诊断日志（写入 data/lazyproxy.log） */
+  log?: (message: string) => void;
 }
 
 const STATE_KEY = Symbol.for("lazy-proxy.fetch-patch");
@@ -99,7 +123,13 @@ function makePatchedFetch(state: PatchState): typeof fetch {
       };
       return state.originalFetch(input, proxiedInit as RequestInit);
     }
-    return fetchViaShim(toRequest(input, init), url, state.opts);
+    try {
+      return await fetchViaShim(toRequest(input, init), url, state.opts);
+    } catch (e) {
+      // 保持 undici 的 `TypeError("fetch failed", { cause })` 形态：
+      // AI SDK / OpenCode 依赖它把网络错误归类为可重试（isRetryable: true）。
+      throw asFetchFailed(e);
+    }
   };
   return patched as typeof fetch;
 }
@@ -151,7 +181,13 @@ async function fetchViaShim(req: Request, url: URL, opts: FetchPatchOptions): Pr
   headers["accept-encoding"] = "identity";
 
   const createConn = (_options: unknown, cb: (err: Error | null, socket?: Socket) => void): void => {
-    tunnelToShim({ shimPort: opts.shimPort, host: targetHost, port: targetPort, isTls })
+    openTunnelWithRetry(
+      { shimPort: opts.shimPort, host: targetHost, port: targetPort, isTls },
+      opts.timeouts,
+      opts.retry,
+      req.signal,
+      opts.log,
+    )
       .then((sock) => cb(null, sock as unknown as Socket))
       .catch((e: unknown) => cb(e instanceof Error ? e : new Error(String(e))));
   };
@@ -177,37 +213,139 @@ async function fetchViaShim(req: Request, url: URL, opts: FetchPatchOptions): Pr
   return toWebResponse(res);
 }
 
+/** 隧道建立阶段失败时按指数退避重试；`forever` 模式直到调用方 abort */
+async function openTunnelWithRetry(
+  target: { shimPort: number; host: string; port: number; isTls: boolean },
+  timeouts: FetchPatchTimeouts | undefined,
+  retry: FetchRetryOptions | undefined,
+  signal: AbortSignal | undefined,
+  log: ((message: string) => void) | undefined,
+): Promise<Socket | TLSSocket> {
+  if (retry?.forever !== true) return tunnelToShim(target, timeouts, signal);
+  const baseDelay = Math.max(100, retry.delayMs ?? 1000);
+  const maxDelay = Math.max(baseDelay, retry.maxDelayMs ?? 10_000);
+  let delay = baseDelay;
+  let attempt = 0;
+  for (;;) {
+    if (signal?.aborted) throw abortError();
+    attempt++;
+    try {
+      return await tunnelToShim(target, timeouts, signal);
+    } catch (e) {
+      if (isAbortError(e) || signal?.aborted) throw abortError();
+      const why = e instanceof Error ? e.message : String(e);
+      try {
+        log?.(`lazy-proxy tunnel attempt #${attempt} failed; retrying in ${delay}ms: ${why}`);
+      } catch {
+        /* 日志失败不影响重试 */
+      }
+      await sleepAbortable(delay, signal);
+      delay = Math.min(maxDelay, Math.max(baseDelay, Math.round(delay * 2)));
+    }
+  }
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      cleanup();
+      reject(abortError());
+    };
+    const cleanup = (): void => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function abortError(): Error {
+  const e = new Error("This operation was aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+function isAbortError(e: unknown): boolean {
+  return e instanceof Error && e.name === "AbortError";
+}
+
+/** Node fetch 的可重试错误形态：TypeError("fetch failed", { cause: 原始诊断 }) */
+function asFetchFailed(e: unknown): Error {
+  const err = e instanceof Error ? e : new Error(String(e));
+  if (isAbortError(err)) return err;
+  if (err instanceof TypeError && /^fetch failed$/i.test(err.message)) return err;
+  return new TypeError("fetch failed", { cause: err });
+}
+
 /** 经 shim 建立 CONNECT 隧道：net → CONNECT → 200 → （TLS）→ 返回可写 socket */
-function tunnelToShim(target: {
-  shimPort: number;
-  host: string;
-  port: number;
-  isTls: boolean;
-}): Promise<Socket | TLSSocket> {
+function tunnelToShim(
+  target: {
+    shimPort: number;
+    host: string;
+    port: number;
+    isTls: boolean;
+  },
+  timeouts?: FetchPatchTimeouts,
+  signal?: AbortSignal,
+): Promise<Socket | TLSSocket> {
   const { shimPort, host, port, isTls } = target;
+  const connectMs = timeouts?.connectMs ?? DEFAULT_SHIM_CONNECT_TIMEOUT_MS;
+  const tlsMs = timeouts?.tlsMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS;
   return new Promise<Socket | TLSSocket>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
     const sock = netConnect({ host: "127.0.0.1", port: shimPort });
     let settled = false;
     let buf = Buffer.alloc(0);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const clearTimer = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const arm = (ms: number, makeError: () => Error): void => {
+      clearTimer();
+      timer = setTimeout(() => fail(makeError()), ms);
+    };
+    function cleanupAbort(): void {
+      signal?.removeEventListener("abort", onAbort);
+    }
+    function onAbort(): void {
+      fail(abortError());
+    }
     const fail = (e: Error): void => {
       if (settled) return;
       settled = true;
-      sock.setTimeout(0);
+      clearTimer();
+      cleanupAbort();
       sock.destroy();
       reject(e);
     };
     const ok = (s: Socket | TLSSocket): void => {
       if (settled) return;
       settled = true;
-      sock.setTimeout(0);
+      clearTimer();
+      cleanupAbort();
       resolve(s);
     };
-    sock.setTimeout(30_000, () => fail(new Error(`lazy-proxy tunnel timeout (shim 127.0.0.1:${shimPort})`)));
-    sock.once("error", fail);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    sock.once("error", (e) => fail(e instanceof Error ? e : new Error(String(e))));
     sock.once("close", () => fail(new Error("lazy-proxy tunnel closed before established")));
     sock.once("connect", () => {
       sock.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
     });
+    arm(connectMs, () => new Error(`lazy-proxy shim did not answer CONNECT within ${connectMs}ms (127.0.0.1:${shimPort})`));
     const onData = (chunk: Buffer): void => {
       buf = Buffer.concat([buf, chunk]);
       const idx = buf.indexOf("\r\n\r\n");
@@ -217,32 +355,46 @@ function tunnelToShim(target: {
       const line = buf.subarray(0, idx).toString("latin1").split("\r\n")[0] ?? "";
       const status = Number(/^HTTP\/1\.[01] (\d{3})/i.exec(line)?.[1] ?? 0);
       if (status !== 200) {
+        clearTimer();
         let bodyBuf = rest;
         const onMore = (c: Buffer): void => {
           bodyBuf = Buffer.concat([bodyBuf, c]);
         };
+        let bodyTimer: ReturnType<typeof setTimeout> | null = null;
         const finish = (): void => {
+          if (bodyTimer !== null) {
+            clearTimeout(bodyTimer);
+            bodyTimer = null;
+          }
           sock.removeListener("data", onMore);
           fail(new Error(extractShimError(status, bodyBuf)));
         };
+        bodyTimer = setTimeout(finish, 2000);
         sock.on("data", onMore);
-        sock.setTimeout(2000, finish);
         sock.once("end", finish);
         sock.once("close", finish);
         return;
       }
+      clearTimer();
       if (rest.length > 0) sock.unshift(rest);
       if (!isTls) {
         ok(sock);
         return;
       }
+      arm(
+        tlsMs,
+        () => new Error(`lazy-proxy TLS handshake did not complete within ${tlsMs}ms (proxy node or upstream may be unreachable)`),
+      );
       const tls = tlsConnect({
         socket: sock,
         ...(isIP(host) ? {} : { servername: host }),
         ALPNProtocols: ["http/1.1"],
       });
       tls.once("secureConnect", () => ok(tls));
-      tls.once("error", (e) => fail(e instanceof Error ? e : new Error(String(e))));
+      tls.once("error", (e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        fail(new Error(`lazy-proxy TLS handshake via proxy failed: ${msg}`));
+      });
     };
     sock.on("data", onData);
   });

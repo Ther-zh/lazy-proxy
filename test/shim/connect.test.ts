@@ -34,21 +34,30 @@ function readyCore(): CoreManager {
 function connectTunnel(
   shimPort: number,
   target: string,
+  deadlineMs = 5000,
 ): Promise<{ status: number; socket: Socket; rest: Buffer }> {
   return new Promise((resolve, reject) => {
     const s = netConnect({ host: "127.0.0.1", port: shimPort });
     let buf = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      s.destroy();
+      reject(new Error("CONNECT handshake timed out"));
+    }, deadlineMs);
     const onData = (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       const idx = buf.indexOf("\r\n\r\n");
       if (idx === -1) return;
+      clearTimeout(timer);
       s.removeListener("data", onData);
       const line = buf.subarray(0, idx).toString("latin1").split("\r\n")[0];
       const m = /^HTTP\/1\.[01] (\d{3})/.exec(line);
       resolve({ status: m ? Number(m[1]) : 0, socket: s, rest: buf.subarray(idx + 4) });
     };
     s.on("data", onData);
-    s.once("error", reject);
+    s.once("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
     s.once("connect", () => s.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`));
   });
 }
@@ -78,6 +87,79 @@ async function startEchoTcp(): Promise<{ port: number; stop: () => void }> {
   const addr = server.address();
   const port = typeof addr === "object" && addr !== null ? addr.port : 0;
   return { port, stop: () => server.close() };
+}
+
+/** 收到 CONNECT 后回 200，随即 RST —— 复现“隧道建立后 core 异常断开” */
+async function startResettingCore(): Promise<{ port: number; stop: () => void }> {
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {
+      /* noop */
+    });
+    let buf = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.indexOf("\r\n\r\n") === -1) return;
+      socket.removeListener("data", onData);
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      setTimeout(() => socket.resetAndDestroy(), 30);
+    };
+    socket.on("data", onData);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+  return {
+    port,
+    stop: () => {
+      for (const s of sockets) s.destroy();
+      server.close();
+    },
+  };
+}
+
+/** 接受 TCP 但永不应答 CONNECT —— 复现“core 卡死” */
+async function startSilentCore(): Promise<{ port: number; stop: () => void }> {
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {
+      /* noop */
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+  return {
+    port,
+    stop: () => {
+      for (const s of sockets) s.destroy();
+      server.close();
+    },
+  };
+}
+
+/** 收集一段时间内 socket 收到的字节（含已缓冲的 rest） */
+function collectFor(socket: Socket, initial: Buffer, ms: number): Promise<Buffer> {
+  return new Promise((resolve) => {
+    let acc = initial;
+    const onData = (chunk: Buffer) => {
+      acc = Buffer.concat([acc, chunk]);
+    };
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      socket.removeListener("data", onData);
+      resolve(acc);
+    };
+    socket.on("data", onData);
+    socket.once("close", done);
+    setTimeout(done, ms);
+  });
 }
 
 describe("isProxyHost / effectiveProxyHosts", () => {
@@ -168,5 +250,58 @@ describe("CONNECT tunneling", () => {
     expect(t.rest.toString("utf8")).toContain("core boom");
     t.socket.destroy();
     shim.close();
+  });
+
+  it("never writes plaintext HTTP after the tunnel is established (core resets mid-TLS)", async () => {
+    const misbehaving = await startResettingCore();
+    const core = readyCore();
+    core.ensureUp = async () => {};
+    const shim = await startShimServer(cfgOf({ corePort: misbehaving.port }), core);
+
+    const t = await connectTunnel(shim.port, "chatgpt.com:443");
+    expect(t.status).toBe(200);
+    const after = await collectFor(t.socket, t.rest, 300);
+    expect(after.toString("latin1")).not.toContain("502");
+    expect(after.length).toBe(0);
+
+    t.socket.destroy();
+    shim.close();
+    misbehaving.stop();
+  });
+
+  it("returns 502 when the core never answers CONNECT (timeout)", async () => {
+    const silent = await startSilentCore();
+    const core = readyCore();
+    core.ensureUp = async () => {};
+    const shim = await startShimServer(cfgOf({ corePort: silent.port }), core, {
+      coreConnectTimeoutMs: 100,
+    });
+
+    const t = await connectTunnel(shim.port, "chatgpt.com:443", 2000);
+    expect(t.status).toBe(502);
+    expect(t.rest.toString("utf8")).toMatch(/CONNECT/i);
+    t.socket.destroy();
+    shim.close();
+    silent.stop();
+  });
+
+  it("keeps a healthy tunnel open after the CONNECT timeout window elapses", async () => {
+    const coreProxy = await startFakeCoreProxy(0);
+    const core = readyCore();
+    core.ensureUp = async () => {};
+    const shim = await startShimServer(cfgOf({ corePort: coreProxy.port }), core, {
+      coreConnectTimeoutMs: 50,
+    });
+
+    const t = await connectTunnel(shim.port, "chatgpt.com:443");
+    expect(t.status).toBe(200);
+    await sleep(120);
+    t.socket.write("ping");
+    const echoed = await readBytes(t.socket, 4, t.rest);
+    expect(echoed.subarray(0, 4).toString("latin1")).toBe("ping");
+
+    t.socket.destroy();
+    shim.close();
+    coreProxy.stop();
   });
 });

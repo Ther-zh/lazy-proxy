@@ -25,13 +25,15 @@ interface FakeCtx {
   emitExit: (code: number | null, signal: string | null) => void;
   setExternal: (v: boolean) => void;
   setPost: (v: boolean) => void;
+  setLinger: (ms: number) => void;
   setNow: (n: number) => void;
 }
 
 function makeCtx(): FakeCtx {
   let now = 1_000_000;
-  let externalReady = false;
   let postReady = true;
+  let listening = false;
+  let lingerMs = 0;
   let checks = 0;
   const listeners = new Set<(code: number | null, sig: string | null) => void>();
   const child: SpawnedProcess = {
@@ -41,6 +43,16 @@ function makeCtx(): FakeCtx {
     },
     kill: () => {},
   };
+  /** kill 之后端口是否残留一段时间（模拟 Windows 进程退出延迟） */
+  const releasePort = () => {
+    if (lingerMs <= 0) {
+      listening = false;
+    } else {
+      setTimeout(() => {
+        listening = false;
+      }, lingerMs);
+    }
+  };
   const ctx: FakeCtx = {
     spawnCalls: 0,
     killPids: [],
@@ -48,13 +60,17 @@ function makeCtx(): FakeCtx {
     configCalls: 0,
     child,
     emitExit: (c, s) => {
+      listening = false;
       for (const l of [...listeners]) l(c, s);
     },
     setExternal: (v) => {
-      externalReady = v;
+      listening = v;
     },
     setPost: (v) => {
       postReady = v;
+    },
+    setLinger: (ms) => {
+      lingerMs = ms;
     },
     setNow: (n) => {
       now = n;
@@ -74,10 +90,15 @@ function makeCtx(): FakeCtx {
       },
       isPortReady: async (_port: number, timeoutMs: number) => {
         checks++;
-        return timeoutMs <= 1000 ? externalReady : postReady;
+        // 短探测（外部核探测/存活探测/停核等待）只看当前端口；启动等待模拟进程绑定端口
+        if (timeoutMs <= 1000) return listening;
+        if (!postReady) return false;
+        listening = true;
+        return true;
       },
       killTree: (pid) => {
         ctx.killPids.push(pid);
+        releasePort();
       },
       now: () => now,
     },
@@ -159,6 +180,48 @@ describe("CoreManager", () => {
     await m.stop();
     expect(m.state).toBe("idle");
     expect(ctx.killPids).toEqual([4242]);
+    m.idle.dispose();
+  });
+
+  it("restarts when an external core disappears", async () => {
+    const ctx = makeCtx();
+    ctx.setExternal(true);
+    const m = new CoreManager(baseCfg, "C:/data", ctx.deps);
+    await m.ensureUp();
+    expect(m.external).toBe(true);
+    expect(ctx.spawnCalls).toBe(0);
+
+    ctx.setExternal(false);
+    ctx.setNow(1_002_000);
+    await m.ensureUp();
+    expect(m.state).toBe("running");
+    expect(m.external).toBe(false);
+    expect(ctx.spawnCalls).toBe(1);
+    m.idle.dispose();
+  });
+
+  it("waits for the port to be released before reporting idle", async () => {
+    const ctx = makeCtx();
+    ctx.setLinger(300);
+    const m = new CoreManager(baseCfg, "C:/data", ctx.deps);
+    await m.ensureUp();
+
+    const t0 = Date.now();
+    await m.stop();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+
+    await m.ensureUp();
+    expect(m.external).toBe(false);
+    expect(ctx.spawnCalls).toBe(2);
+    m.idle.dispose();
+  });
+
+  it("coalesces concurrent cold starts into a single spawn", async () => {
+    const ctx = makeCtx();
+    const m = new CoreManager(baseCfg, "C:/data", ctx.deps);
+    await Promise.all([m.ensureUp(), m.ensureUp(), m.ensureUp()]);
+    expect(ctx.spawnCalls).toBe(1);
+    expect(ctx.configCalls).toBe(1);
     m.idle.dispose();
   });
 

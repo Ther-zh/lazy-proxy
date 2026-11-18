@@ -126,12 +126,44 @@ describe("ensureBinary", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("throws when mihomo.exe missing in archive", async () => {
+  it("finds the official asset filename (mihomo-windows-amd64.exe)", async () => {
+    const dir = tempDir();
+    const data = join(dir, "data");
+    const p = await ensureBinary(
+      data,
+      cfg,
+      deps({
+        unzip: (_zip, dest) => writeFileSync(join(dest, "mihomo-windows-amd64.exe"), FAKE_EXE),
+      }),
+    );
+    expect(p).toBe(join(data, "bin", "mihomo-v1.19.32.exe"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("finds the executable in a nested directory", async () => {
+    const dir = tempDir();
+    const data = join(dir, "data");
+    const p = await ensureBinary(
+      data,
+      cfg,
+      deps({
+        unzip: (_zip, dest) => {
+          const nested = join(dest, "release");
+          mkdirSync(nested, { recursive: true });
+          writeFileSync(join(nested, "mihomo-windows-amd64.exe"), FAKE_EXE);
+        },
+      }),
+    );
+    expect(p).toBe(join(data, "bin", "mihomo-v1.19.32.exe"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("throws when no mihomo executable is present in the archive", async () => {
     const dir = tempDir();
     const data = join(dir, "data");
     await expect(
       ensureBinary(data, cfg, deps({ unzip: () => {} })),
-    ).rejects.toThrow(/mihomo.exe not found/);
+    ).rejects.toThrow(/no mihomo.*\.exe found/);
     rmSync(dir, { recursive: true, force: true });
   });
 });

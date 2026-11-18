@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { injectProxyEnv, mergeNoProxy } from "../../src/plugin/env";
+import { acquireProxyEnv, injectProxyEnv, mergeNoProxy } from "../../src/plugin/env";
 
 describe("mergeNoProxy", () => {
   it("keeps existing entries, appends defaults, dedupes", () => {
@@ -31,5 +31,20 @@ describe("injectProxyEnv", () => {
     expect(env.http_proxy).toBeUndefined();
     expect(env.NO_PROXY).toBe("example.com");
     expect(env.no_proxy).toBeUndefined();
+  });
+
+  it("acquireProxyEnv keeps env until the last reference is released", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const first = acquireProxyEnv(17891, env);
+    const second = acquireProxyEnv(17891, env);
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:17891");
+
+    first.restore();
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:17891");
+
+    second.restore();
+    expect(env.HTTPS_PROXY).toBeUndefined();
+    expect(env.HTTP_PROXY).toBeUndefined();
+    expect(env.NO_PROXY).toBeUndefined();
   });
 });

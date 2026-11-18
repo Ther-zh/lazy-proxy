@@ -121,6 +121,34 @@ describe("shim server integration", () => {
     serverStop(coreProxy);
   });
 
+  it("returns 502 when the upstream never sends response headers (timeout)", async () => {
+    const silent = createHttpServer((req) => {
+      req.resume();
+    });
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    const silentPort = (silent.address() as { port: number }).port;
+    const coreProxy = await startFakeCoreProxy(0);
+    const core = readyCore();
+    const shim = await startShimServer(
+      cfgOf({ corePort: coreProxy.port, upstream: `http://127.0.0.1:${silentPort}` }),
+      core,
+      { forwardResponseTimeoutMs: 100 },
+    );
+
+    const res = await fetch(`http://127.0.0.1:${shim.port}/v1/chat/completions`, {
+      method: "POST",
+      body: "{}",
+    });
+    expect(res.status).toBe(502);
+    const j = (await res.json()) as { error: { message: string } };
+    expect(j.error.message).toMatch(/response timeout/);
+
+    shim.close();
+    (silent as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+    silent.close();
+    serverStop(coreProxy);
+  });
+
   it("returns 502 and decrements when core cannot start", async () => {
     const up = await startUpstream();
     const coreProxy = await startFakeCoreProxy(0);

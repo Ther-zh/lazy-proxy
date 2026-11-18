@@ -3,7 +3,7 @@ import { connect as netConnect, createServer as createTcpServer } from "node:net
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { LazyProxyPlugin } from "../../src/plugin/index";
+import plugin, { LazyProxyPlugin } from "../../src/plugin/index";
 import { resolveConfigDir, startLazyProxy } from "../../src/plugin/runtime";
 
 const ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"] as const;
@@ -73,6 +73,17 @@ async function freePort(): Promise<number> {
   return p;
 }
 
+async function isPortOpen(port: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const s = netConnect({ host: "127.0.0.1", port });
+    s.once("connect", () => {
+      s.destroy();
+      resolve(true);
+    });
+    s.once("error", () => resolve(false));
+  });
+}
+
 function withConfigDir<T>(dir: string, fn: () => Promise<T>): Promise<T> {
   const old = process.env.LAZYPROXY_CONFIG_DIR;
   process.env.LAZYPROXY_CONFIG_DIR = dir;
@@ -88,6 +99,70 @@ describe("plugin entry", () => {
   it("exports an async plugin function", () => {
     expect(typeof LazyProxyPlugin).toBe("function");
     expect(LazyProxyPlugin.constructor.name).toBe("AsyncFunction");
+  });
+
+  it("exports a V2 default definition with id and setup", () => {
+    expect(plugin.id).toBe("lazy-proxy");
+    expect(typeof plugin.setup).toBe("function");
+    expect(typeof plugin.server).toBe("function");
+  });
+
+  it("V2 setup resolves without cleanup when config is missing", async () => {
+    const dir = tempDir();
+    await expect(withConfigDir(dir, () => plugin.setup({} as never))).resolves.toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("V2 setup returns a cleanup that restores env/fetch and closes the shim", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const origFetch = globalThis.fetch;
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen });
+    const cleanup = await withConfigDir(dir, () => plugin.setup({} as never));
+    expect(typeof cleanup).toBe("function");
+    expect(process.env.HTTPS_PROXY).toBe(`http://127.0.0.1:${chosen}`);
+    expect(globalThis.fetch).not.toBe(origFetch);
+
+    await cleanup!();
+    expect(process.env.HTTPS_PROXY).toBeUndefined();
+    expect(globalThis.fetch).toBe(origFetch);
+
+    const closed = await new Promise<boolean>((resolve) => {
+      const s = netConnect({ host: "127.0.0.1", port: chosen });
+      s.once("connect", () => {
+        s.destroy();
+        resolve(false);
+      });
+      s.once("error", () => resolve(true));
+    });
+    expect(closed).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("V2 setup is reference-counted across plugin instances", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const origFetch = globalThis.fetch;
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen });
+    const [first, second] = await withConfigDir(dir, async () => [
+      await plugin.setup({} as never),
+      await plugin.setup({} as never),
+    ]);
+    expect(typeof first).toBe("function");
+    expect(typeof second).toBe("function");
+
+    await first!();
+    expect(await isPortOpen(chosen)).toBe(true);
+    expect(process.env.HTTPS_PROXY).toBe(`http://127.0.0.1:${chosen}`);
+    expect(globalThis.fetch).not.toBe(origFetch);
+
+    await second!();
+    expect(await isPortOpen(chosen)).toBe(false);
+    expect(process.env.HTTPS_PROXY).toBeUndefined();
+    expect(globalThis.fetch).toBe(origFetch);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("resolveConfigDir honors env override", () => {
@@ -184,6 +259,41 @@ describe("plugin entry", () => {
       s.once("error", () => resolve(true));
     });
     expect(closed).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes persistent plugin logs under data/lazyproxy.log", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen });
+    const { ctx } = sdkLikeCtx();
+    const result = (await withConfigDir(dir, () => LazyProxyPlugin(ctx as never))) as {
+      dispose?: () => Promise<void>;
+    };
+
+    const logPath = join(dir, "data", "lazyproxy.log");
+    expect(existsSync(logPath)).toBe(true);
+    expect(readFileSync(logPath, "utf8")).toContain("shim listening");
+
+    await result.dispose?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("honors logLevel=error (no info lines on disk)", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen, logLevel: "error" });
+    const { ctx } = sdkLikeCtx();
+    const result = (await withConfigDir(dir, () => LazyProxyPlugin(ctx as never))) as {
+      dispose?: () => Promise<void>;
+    };
+
+    const logPath = join(dir, "data", "lazyproxy.log");
+    expect(existsSync(logPath)).toBe(false);
+
+    await result.dispose?.();
     rmSync(dir, { recursive: true, force: true });
   });
 

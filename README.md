@@ -9,7 +9,7 @@
 
 This repository ships:
 
-- **opencode plugin** — runs a loopback shim (`127.0.0.1:17891`) that lazily starts/stops the core, and patches `globalThis.fetch` in-process so only selected domains are tunneled. Works in both OpenCode CLI (Bun) and OpenCode Desktop (Electron/Node).
+- **opencode plugin** — runs a loopback shim (`127.0.0.1:17891`) that lazily starts/stops the core, and patches `globalThis.fetch` in-process so only selected domains are tunneled. Works in both OpenCode CLI (Bun) and OpenCode Desktop (Electron/Node), and supports both the V1 plugin entrypoint and the V2 `{ id, setup }` contract.
 - **standalone engine scripts** — `scripts/start-core.mjs` / `scripts/stop-core.mjs` (the same engine the plugin uses, runnable on their own).
 
 The core is [mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta family). Binaries are **not** bundled — the Windows build is downloaded on first run (with a PowerShell fallback if GitHub is unreachable).
@@ -100,13 +100,13 @@ Start opencode once — `~/.config/lazyproxy/config.json` is auto-created. Put y
    }
    ```
 
-3. Restart opencode and check its log for:
+3. Restart opencode and check `~/.config/lazyproxy/data/lazyproxy.log` for:
 
    ```
-   [lazy-proxy] shim on 127.0.0.1:17891; OpenAI traffic goes through the lazy core ...
+   shim listening on 127.0.0.1:17891
    ```
 
-   A `no subscription configured yet` warning means step 2 was missed.
+   OpenCode V2 (Desktop 2.3.x) loads the plugin through the default `{ id: "lazy-proxy", setup }` export; V1 (1.18.29+) uses the `server()` compatibility export. A `no subscription configured yet` warning means step 2 was missed.
 
 ### Standalone engine (without the plugin)
 
@@ -131,10 +131,15 @@ Config file: `~/.config/lazyproxy/config.json` (override the directory with `LAZ
 | Key | Default | Description |
 |-----|---------|-------------|
 | `subscriptionUrl` | — (required) | Clash/mihomo-format subscription URL. Contains your token — **never commit or share this file**. |
-| `subscriptionFile` | — | Local subscription YAML; when set it wins over `subscriptionUrl` (useful when the endpoint is unreachable). |
+| `subscriptionFile` | — | Local subscription YAML used as an offline/first-run fallback. When it is older than 24h (or missing), the plugin tries `subscriptionUrl` first and caches a successful refresh in `data/subscription.cache.yml`; on failure it falls back to the local file and logs a warning. |
 | `proxyHosts` | `["chatgpt.com","openai.com"]` | Hosts routed through the core (suffix match: `openai.com` also covers `auth.openai.com`). Everything else goes direct. The shim `upstream` host is always included. |
 | `excludeNodes` | — | Regex of node names to exclude from the auto group (e.g. `hk|tw` — OpenAI blocks some regions). |
-| `pinNode` | — | Exact node name to pin (highest priority, wins over the auto group). |
+| `pinNode` | — | Preferred node. With `fallbackNodes` set, `PROXY` is `fallback [pin, ...fallbackNodes]`; without it, `fallback [pin, AUTO]`. |
+| `fallbackNodes` | — | Ordered fallback pool (exact node names). Turns `PROXY` into a `fallback` group that health-checks members every 300 s and switches to the next on failure. Invalid/excluded names are ignored; when the pool is non-empty it is authoritative (no broad `AUTO` member). |
+| `healthCheckUrl` | `http://www.gstatic.com/generate_204` | Health-check URL used by `fallback`/`url-test` groups. Must be http(s); invalid values fall back to the default. |
+| `retryForever` | `true` | Keep retrying tunnel/TLS establishment until the caller aborts (or succeeds). Network failures surface as `TypeError("fetch failed", { cause })`, which the AI SDK/opencode classifies as retryable. Set `false` for fast-fail. |
+| `retryDelayMs` | `1000` | Initial retry delay; doubles each attempt (100–60000 ms). |
+| `retryMaxDelayMs` | `10000` | Exponential backoff cap (1000–300000 ms). |
 | `shimPort` | `17891` | Shim listen port (loopback). |
 | `corePort` | `17890` | mihomo mixed-port (loopback). |
 | `idleMs` | `180000` | Kill the core after this much idle time. |
@@ -149,6 +154,23 @@ Notes:
 - Token safety: URLs are redacted (`token`, `key`, `secret`, `password` → `***`) in logs and error messages.
 - Downloads are checksum-recorded on first fetch (TOFU) in `data/bin/mihomo-<version>.sha256`.
 - If the subscription endpoint is unreachable, save its YAML locally and set `subscriptionFile`.
+
+### Profile DNS
+
+The generated mihomo config keeps a sanitized copy of the subscription profile's `dns` section: `default-nameserver`, `nameserver`, `nameserver-policy`, `fallback` and related resolution keys are preserved; `listen` is removed (no port clash) and `enhanced-mode` is forced to `normal` (the core is an HTTP proxy, not a TUN device — fake-ip would return unusable addresses). This matters when the airport publishes a dedicated DoH policy for its node domains: without it, mihomo falls back to the system resolver, which may return poisoned IPs and make every node look dead while Clash Verge works.
+
+### Automatic node fallback
+
+`fallbackNodes` makes the `PROXY` group an ordered `fallback` pool: mihomo health-checks each member (default every 300 s) and switches to the next one when a member fails. `pinNode` is always tried first. This mirrors a Clash Verge `ChatGPT` group (US/JP candidates), but switches automatically:
+
+```jsonc
+{
+  "pinNode": "🇺🇸美国-IEPL-GPT",
+  "fallbackNodes": ["🇯🇵日本-IEPL-GPT", "🇯🇵日本2-IEPL-GPT", "🇺🇸美国2-IEPL-GPT"]
+}
+```
+
+Effective order: pinned US → JP → JP2 → US2. While `fallbackNodes` is non-empty the pool is authoritative — the broad `AUTO` group is not mixed in, so a failed GPT-capable node never silently falls back to a region OpenAI blocks. Use `excludeNodes` if you want to filter regions from the pin-only/AUTO mode.
 
 ## Pointing opencode at it
 
@@ -186,14 +208,27 @@ The Chat-OAuth flow talks to `chatgpt.com` and `auth.openai.com` (not `api.opena
 
 | Symptom | Cause / fix |
 |---------|-------------|
+| `Cannot connect to API: ... Client network socket disconnected before secure TLS connection was established` | The TLS handshake through the proxy node/upstream failed — the shim only relays bytes and cannot fix a dead node. Check `data/lazyproxy.log` and `data/core.log`, then test the core directly: `curl -x http://127.0.0.1:17890 https://www.gstatic.com/generate_204`. If every destination fails, the subscription nodes are dead/blocked or the airport rotated endpoints: refresh `data/subscription.yml` from a working network or switch airports. |
+| `lazy-proxy TLS handshake via proxy failed: ...` | Same as above — the plugin now labels proxy-path TLS failures explicitly. The original OS/TLS message is kept after the colon. |
+| `lazy-proxy shim did not answer CONNECT within 30000ms` | The shim was still cold-starting (first run may download mihomo) or is wedged. The core keeps starting in the background; retry after `core ready` appears in `data/lazyproxy.log`. |
+| Clash Verge connects, but every lazy-proxy node delay is `504` / TLS is reset | The airport's subscription profile carries a `dns` section (often a dedicated DoH `nameserver-policy` for the node domain, e.g. `gd.bjnet2.com`). The generated config now preserves that section (sanitized: no `listen`, `enhanced-mode: normal`), so node hostnames resolve like Clash Verge. If it still fails, check `data/config.yaml` for `dns.nameserver-policy`; a node family without a policy (e.g. `gd2.*`) may be broken on the airport side — Clash Verge shows the same Error/Timeout for it. |
+
+### Retry behavior
+
+Proxy-connection failures (CONNECT/tunnel/TLS, before any HTTP request bytes are sent) are retried inside the plugin with exponential backoff (`retryForever`, default on) until the request is aborted or a connection succeeds. Each retry is logged to `data/lazyproxy.log` as `tunnel attempt #N failed; retrying in ...`. When the caller finally gives up, the plugin throws `TypeError("fetch failed", { cause })` — the exact shape the AI SDK/opencode recognizes as retryable — so the client's own retry policy can re-issue the request. The caller's provider timeout still bounds a single HTTP request; with the default 5-minute header timeout that is 5 minutes of continuous reconnects per request.
 | `Cannot connect ... ECONNREFUSED 127.0.0.1:17890` | Something is pointed directly at the **core** port while the core is not running (e.g. a leftover user-level `HTTPS_PROXY=http://127.0.0.1:17890`). Apps should not use the core port directly — use the shim via `baseURL`, or let the plugin handle it. Remove stale proxy env vars (Windows: `reg query HKCU\Environment`; also check System Properties → Environment Variables) and restart the app. |
-| `failed to load plugin` in opencode's log | The plugin file crashed while loading. Make sure the latest `dist/plugin.js` is installed. The plugin is designed never to throw on load; if it still happens, capture the log line and report it. |
+| `failed to load plugin` in opencode's log | The plugin file crashed while loading, or an old bundle is installed. OpenCode V2 requires a default `{ id, setup }` export (`Plugin must export a default definition ...` in the log); rebuild and redeploy the latest `dist/plugin.js`. The plugin is designed never to throw on load; if it still happens, capture the log line and report it. |
 | No `[lazy-proxy] shim on ...` line after restart | `subscriptionUrl` is still empty — fill `config.json` and restart opencode. |
 | No listener on `17891` while opencode runs | Plugin not loaded or crashed (see above). |
 | `403` from OpenAI | Egress region blocked (e.g. HK/TW). Pin a US/JP node: `pinNode`, or `excludeNodes` the blocked regions. |
 | Core won't start | Run `bun scripts/start-core.mjs` in a terminal to see errors; run mihomo manually (`data/bin/mihomo-<version>.exe -d <config-dir>/data`) to see core logs. GitHub blocked → set `downloadBaseUrl`, or pre-place the binary and set `corePath`. |
 | `EADDRINUSE` on the shim port | Another instance already holds `shimPort`; the plugin reuses it. Change `shimPort` if that is not what you want. |
 | Verify what is listening | Windows: `netstat -ano | findstr 1789`; macOS/Linux: `lsof -iTCP:17890 -sTCP:LISTEN`. Expect `17891` while opencode runs; `17890` only while a request is in flight (or before the idle timer expires). |
+
+### Logs
+
+- `~/.config/lazyproxy/data/lazyproxy.log` — plugin/shim/core lifecycle and subscription refresh decisions (honors `logLevel`), rotated at 2 MB.
+- `~/.config/lazyproxy/data/core.log` — mihomo stdout/stderr (dial failures, health checks), rotated at 2 MB.
 
 ## Security notes
 
@@ -207,7 +242,7 @@ The Chat-OAuth flow talks to `chatgpt.com` and `auth.openai.com` (not `api.opena
 ```
 src/
   config/    schema + loader (validation, defaults, proxyHosts, redaction)
-  core/      mihomo lifecycle: download (TOFU), config generation, idle watchdog, process manager
+  core/      mihomo lifecycle: download (TOFU), config generation, idle watchdog, process manager, file logs
   plugin/    opencode entry: safe logging, process-scoped env injection, globalThis.fetch patch
   shim/      loopback HTTP + CONNECT shim (node:http) and transport helpers
 scripts/     start-core.mjs / stop-core.mjs / build.mjs
@@ -223,7 +258,7 @@ bun run build         # esbuild bundle -> dist/plugin.js
 
 Notes:
 
-- `src/plugin/index.ts` exports only `LazyProxyPlugin` — keep it that way (opencode auto-loads plugin exports).
+- `src/plugin/index.ts` exports a V2 default definition (`{ id: "lazy-proxy", setup }`) plus the named `LazyProxyPlugin` / `server()` V1 compatibility entrypoint. V2 `setup` returns a cleanup function; V1 `server()` returns `{ dispose }`.
 - `dist/plugin.js` is a self-contained bundle; deploy it by copying to `~/.config/opencode/plugins/lazy-proxy.js`.
 
 ## Caveats

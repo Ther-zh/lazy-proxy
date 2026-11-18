@@ -48,6 +48,48 @@ describe("validateConfig", () => {
     expect(c.downloadBaseUrl).toBe("https://mirror");
   });
 
+  it("parses fallbackNodes (order/trim/dedupe, drops non-strings)", () => {
+    const c = validateConfig({
+      ...valid,
+      fallbackNodes: [" JP-01 ", "US-01", "JP-01", 42, ""],
+    });
+    expect(c.fallbackNodes).toEqual(["JP-01", "US-01"]);
+    expect(validateConfig({ ...valid }).fallbackNodes).toBeUndefined();
+    expect(validateConfig({ ...valid, fallbackNodes: [] }).fallbackNodes).toBeUndefined();
+    expect(validateConfig({ ...valid, fallbackNodes: "x" }).fallbackNodes).toBeUndefined();
+  });
+
+  it("validates healthCheckUrl with a gstatic default", () => {
+    expect(validateConfig({ ...valid }).healthCheckUrl).toBe(DEFAULTS.healthCheckUrl);
+    expect(validateConfig({ ...valid, healthCheckUrl: " https://chatgpt.com/cdn-cgi/trace " }).healthCheckUrl).toBe(
+      "https://chatgpt.com/cdn-cgi/trace",
+    );
+    expect(validateConfig({ ...valid, healthCheckUrl: "ftp://nope" }).healthCheckUrl).toBe(
+      DEFAULTS.healthCheckUrl,
+    );
+  });
+
+  it("parses retry settings with defaults and bounds", () => {
+    const c = validateConfig({ ...valid });
+    expect(c.retryForever).toBe(true);
+    expect(c.retryDelayMs).toBe(1000);
+    expect(c.retryMaxDelayMs).toBe(10000);
+
+    const c2 = validateConfig({
+      ...valid,
+      retryForever: false,
+      retryDelayMs: 50,
+      retryMaxDelayMs: 999999,
+    });
+    expect(c2.retryForever).toBe(false);
+    expect(c2.retryDelayMs).toBe(100);
+    expect(c2.retryMaxDelayMs).toBe(300000);
+
+    const c3 = validateConfig({ ...valid, retryForever: "yes", retryDelayMs: "x" });
+    expect(c3.retryForever).toBe(true);
+    expect(c3.retryDelayMs).toBe(1000);
+  });
+
   it("parses proxyHosts (trim/lowercase/dedupe) and falls back to defaults", () => {
     const c1 = validateConfig({
       ...valid,

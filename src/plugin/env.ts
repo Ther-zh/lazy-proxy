@@ -52,3 +52,39 @@ export function injectProxyEnv(port: number, env: NodeJS.ProcessEnv = process.en
     },
   };
 }
+
+interface ActiveProxyEnv {
+  handle: ProxyEnvHandle;
+  refs: number;
+}
+
+let activeEnv: ActiveProxyEnv | null = null;
+
+/**
+ * 引用计数的 env 注入：V2 会按 location 多次调用 setup，任一实例 dispose 时
+ * 不能把其他实例仍在使用的代理 env 提前清掉。最后一个 handle restore 时才恢复原值。
+ */
+export function acquireProxyEnv(port: number, env: NodeJS.ProcessEnv = process.env): ProxyEnvHandle {
+  if (activeEnv && activeEnv.handle.proxyUrl === `http://127.0.0.1:${port}`) {
+    activeEnv.refs += 1;
+    return consumerEnvHandle(activeEnv);
+  }
+  const state: ActiveProxyEnv = { handle: injectProxyEnv(port, env), refs: 1 };
+  activeEnv = state;
+  return consumerEnvHandle(state);
+}
+
+function consumerEnvHandle(state: ActiveProxyEnv): ProxyEnvHandle {
+  let released = false;
+  return {
+    proxyUrl: state.handle.proxyUrl,
+    restore: () => {
+      if (released) return;
+      released = true;
+      state.refs -= 1;
+      if (state.refs > 0) return;
+      if (activeEnv === state) activeEnv = null;
+      state.handle.restore();
+    },
+  };
+}

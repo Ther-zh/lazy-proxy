@@ -103,7 +103,11 @@ export interface ForwardOptions {
   corePort: number | null;
   /** 目标绝对 URL */
   targetUrl: string;
+  /** 等待响应头的超时（毫秒）；响应头到达后计时器清除，流式正文不受影响 */
+  responseTimeoutMs?: number;
 }
+
+export const DEFAULT_FORWARD_RESPONSE_TIMEOUT_MS = 120_000;
 
 /**
  * 转发一个 HTTP 请求（流式）：经核心（mihomo mixed-port）或直连。
@@ -137,10 +141,43 @@ export function forwardRequest(
         agent: false,
       };
 
+  const timeoutMs =
+    opts.responseTimeoutMs && opts.responseTimeoutMs > 0
+      ? opts.responseTimeoutMs
+      : DEFAULT_FORWARD_RESPONSE_TIMEOUT_MS;
+
   return new Promise<void>((resolve, reject) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      if (done) return;
+      done = true;
+      timer = null;
+      upstream.destroy();
+      reject(new Error(`lazy-proxy upstream response timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+    const clearTimer = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const resolveOnce = () => {
+      if (done) return;
+      done = true;
+      clearTimer();
+      resolve();
+    };
+    const rejectOnce = (e: Error) => {
+      if (done) return;
+      done = true;
+      clearTimer();
+      reject(e);
+    };
+
     const upstream = send(
       requestOptions,
       (upRes) => {
+        clearTimer();
         const outHeaders: Record<string, string | string[]> = {};
         for (const [k, v] of Object.entries(upRes.headers)) {
           if (v === undefined) continue;
@@ -149,14 +186,14 @@ export function forwardRequest(
         }
         res.writeHead(upRes.statusCode ?? 502, outHeaders);
         upRes.pipe(res);
-        upRes.on("end", () => resolve());
+        upRes.on("end", resolveOnce);
         upRes.on("error", (e) => {
           res.destroy();
-          reject(e);
+          rejectOnce(e);
         });
       },
     );
-    upstream.on("error", reject);
+    upstream.on("error", rejectOnce);
     req.on("error", () => upstream.destroy());
     req.pipe(upstream);
   });

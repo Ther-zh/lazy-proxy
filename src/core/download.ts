@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  type Dirent,
+} from "node:fs";
 import { join } from "node:path";
 import type { LazyProxyConfig } from "../config/schema";
 import type { Fetcher } from "./generate-config";
@@ -126,12 +135,32 @@ export async function ensureBinary(
   const tmpDir = join(binDir, `unzip-${version}`);
   mkdirSync(tmpDir, { recursive: true });
   deps.unzip(tmpZip, tmpDir);
-  const extracted = join(tmpDir, "mihomo.exe");
-  if (!existsSync(extracted)) {
-    throw new Error("mihomo.exe not found in archive");
+  // 官方资产内的文件名是 mihomo-windows-amd64.exe（不同版本/平台前缀不同），不能硬编码 mihomo.exe
+  const extracted = findExecutable(tmpDir);
+  if (!extracted) {
+    throw new Error("no mihomo*.exe found in archive");
   }
   renameSync(extracted, target);
   rmSync(tmpZip, { force: true });
   rmSync(tmpDir, { recursive: true, force: true });
   return target;
+}
+
+function findExecutable(dir: string): string | null {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const nested = findExecutable(full);
+      if (nested) return nested;
+    } else if (/^mihomo.*\.exe$/i.test(entry.name)) {
+      return full;
+    }
+  }
+  return null;
 }

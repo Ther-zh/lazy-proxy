@@ -16,6 +16,18 @@ export interface ShimHandle {
   close: () => void;
 }
 
+export interface ShimOptions {
+  /** 等待核心回应 CONNECT 的超时（毫秒） */
+  coreConnectTimeoutMs?: number;
+  /** 等待上游响应头的超时（毫秒；流式正文不受影响） */
+  forwardResponseTimeoutMs?: number;
+  /** 日志输出（默认带 [lazy-proxy] 前缀的 console.log） */
+  log?: (msg: string) => void;
+}
+
+export const DEFAULT_CORE_CONNECT_TIMEOUT_MS = 10_000;
+export const DEFAULT_FORWARD_RESPONSE_TIMEOUT_MS = 120_000;
+
 /** 域名是否命中代理白名单（后缀匹配：chatgpt.com 覆盖 *.chatgpt.com） */
 export function isProxyHost(host: string, patterns: readonly string[]): boolean {
   const h = host.trim().toLowerCase();
@@ -60,19 +72,26 @@ function raw502(msg: string): string {
  * - connect：白名单域名 → 懒启动核心并隧道；其余域名 → 直连隧道；
  * - 只有经核心的流量计入 idle 生命周期。
  */
-export function startShimServer(cfg: LazyProxyConfig, core: CoreManager): Promise<ShimHandle> {
+export function startShimServer(
+  cfg: LazyProxyConfig,
+  core: CoreManager,
+  options: ShimOptions = {},
+): Promise<ShimHandle> {
   const handlers: ShimHandlers = {
     ensureUp: () => core.ensureUp(),
     onRequestStart: () => core.onRequestStart(),
     onRequestEnd: () => core.onRequestEnd(),
-    log: (m) => console.log(`[lazy-proxy] ${m}`),
+    log: options.log ?? ((m) => console.log(`[lazy-proxy] ${m}`)),
   };
+  const coreConnectTimeoutMs = options.coreConnectTimeoutMs ?? DEFAULT_CORE_CONNECT_TIMEOUT_MS;
+  const forwardResponseTimeoutMs =
+    options.forwardResponseTimeoutMs ?? DEFAULT_FORWARD_RESPONSE_TIMEOUT_MS;
 
   const server = createServer((req, res) => {
-    void handleHttp(req, res, cfg, handlers);
+    void handleHttp(req, res, cfg, handlers, forwardResponseTimeoutMs);
   });
   server.on("connect", (req, clientSocket, head) => {
-    void handleConnect(req, clientSocket as Socket, head, cfg, handlers);
+    void handleConnect(req, clientSocket as Socket, head, cfg, handlers, coreConnectTimeoutMs);
   });
 
   return new Promise<ShimHandle>((resolve, reject) => {
@@ -108,6 +127,7 @@ async function handleHttp(
   res: ServerResponse,
   cfg: LazyProxyConfig,
   handlers: ShimHandlers,
+  forwardTimeoutMs: number,
 ): Promise<void> {
   handlers.onRequestStart();
   try {
@@ -134,7 +154,11 @@ async function handleHttp(
     if (viaCore) {
       await handlers.ensureUp();
     }
-    await forwardRequest(req, res, { corePort: viaCore ? cfg.corePort : null, targetUrl });
+    await forwardRequest(req, res, {
+      corePort: viaCore ? cfg.corePort : null,
+      targetUrl,
+      responseTimeoutMs: forwardTimeoutMs,
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     handlers.log(`forward failed: ${msg}`);
@@ -159,6 +183,7 @@ async function handleConnect(
   head: Buffer,
   cfg: LazyProxyConfig,
   handlers: ShimHandlers,
+  coreConnectTimeoutMs: number,
 ): Promise<void> {
   const raw = req.url ?? "";
   const idx = raw.lastIndexOf(":");
@@ -200,10 +225,25 @@ async function handleConnect(
   const coreSock = netConnect({ host: "127.0.0.1", port: cfg.corePort });
   let established = false;
   let failed = false;
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearConnectTimer = () => {
+    if (connectTimer !== null) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+  };
   const fail = (why: string) => {
     if (failed) return;
     failed = true;
+    clearConnectTimer();
     handlers.log(`core tunnel failed (${host}:${port}): ${why}`);
+    if (established) {
+      // 隧道已建立：客户端可能已进入 TLS 握手，绝不能写入明文 HTTP（否则触发 WRONG_VERSION_NUMBER）
+      if (!clientSocket.destroyed) clientSocket.destroy();
+      coreSock.destroy();
+      endOnce();
+      return;
+    }
     if (!clientSocket.destroyed) clientSocket.end(raw502(`core tunnel failed: ${why}`));
     coreSock.destroy();
     endOnce();
@@ -211,16 +251,25 @@ async function handleConnect(
 
   coreSock.on("error", (e) => fail(e.message));
   coreSock.on("close", () => {
+    clearConnectTimer();
     if (!established) fail("closed before tunnel established");
     else {
       if (!clientSocket.destroyed) clientSocket.destroy();
       endOnce();
     }
   });
-  clientSocket.on("close", () => coreSock.destroy());
+  clientSocket.on("close", () => {
+    clearConnectTimer();
+    coreSock.destroy();
+  });
   coreSock.once("connect", () => {
     coreSock.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
   });
+  connectTimer = setTimeout(
+    () => fail(`core did not answer CONNECT within ${coreConnectTimeoutMs}ms`),
+    coreConnectTimeoutMs,
+  );
+  connectTimer.unref?.();
 
   let buf = Buffer.alloc(0);
   const onData = (chunk: Buffer) => {
@@ -240,6 +289,7 @@ async function handleConnect(
       return;
     }
     established = true;
+    clearConnectTimer();
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head.length) coreSock.write(head);
     if (rest.length) clientSocket.write(rest);
