@@ -25,7 +25,18 @@ interface ActiveRuntime {
   refs: number;
 }
 
-let active: ActiveRuntime | null = null;
+interface RuntimeRegistry {
+  active: ActiveRuntime | null;
+  starting: Map<string, Promise<ActiveRuntime | null>>;
+}
+
+const RUNTIME_REGISTRY_KEY = Symbol.for("lazy-proxy.runtime-registry");
+
+function runtimeRegistry(): RuntimeRegistry {
+  const root = globalThis as typeof globalThis & { [RUNTIME_REGISTRY_KEY]?: RuntimeRegistry };
+  root[RUNTIME_REGISTRY_KEY] ??= { active: null, starting: new Map() };
+  return root[RUNTIME_REGISTRY_KEY];
+}
 
 /** 安装进程内 fetch 补丁：带上重试配置与落盘日志（供插件入口与测试复用） */
 export function installRuntimeFetchPatch(
@@ -53,10 +64,25 @@ export function installRuntimeFetchPatch(
  * 只释放自己的引用，最后一个引用释放时才真正关闭 shim。
  */
 export async function startLazyProxy(cfgDir: string): Promise<ShimHandle | null> {
-  if (active && active.cfgDir === cfgDir) {
-    active.refs += 1;
-    return consumerHandle(active);
+  const registry = runtimeRegistry();
+  if (registry.active && registry.active.cfgDir === cfgDir) {
+    registry.active.refs += 1;
+    return consumerHandle(registry, registry.active);
   }
+
+  let startup = registry.starting.get(cfgDir);
+  if (!startup) {
+    startup = createRuntime(cfgDir, registry).finally(() => registry.starting.delete(cfgDir));
+    registry.starting.set(cfgDir, startup);
+  }
+
+  const runtime = await startup;
+  if (!runtime) return null;
+  runtime.refs += 1;
+  return consumerHandle(registry, runtime);
+}
+
+async function createRuntime(cfgDir: string, registry: RuntimeRegistry): Promise<ActiveRuntime | null> {
   const cfg = loadConfig(cfgDir);
   if (!cfg.subscriptionUrl) return null;
   const dataDir = join(cfgDir, "data");
@@ -65,12 +91,12 @@ export async function startLazyProxy(cfgDir: string): Promise<ShimHandle | null>
   const core = new CoreManager(cfg, dataDir, { ...defaultCoreDeps(), log: logger });
   const handle = await startShimServer(cfg, core, { log: (m) => logger("info", m) });
   logger("info", `shim listening on 127.0.0.1:${handle.port}`);
-  const runtime: ActiveRuntime = { cfgDir, handle, refs: 1 };
-  active = runtime;
-  return consumerHandle(runtime);
+  const runtime: ActiveRuntime = { cfgDir, handle, refs: 0 };
+  registry.active = runtime;
+  return runtime;
 }
 
-function consumerHandle(runtime: ActiveRuntime): ShimHandle {
+function consumerHandle(registry: RuntimeRegistry, runtime: ActiveRuntime): ShimHandle {
   let released = false;
   return {
     port: runtime.handle.port,
@@ -79,7 +105,7 @@ function consumerHandle(runtime: ActiveRuntime): ShimHandle {
       released = true;
       runtime.refs -= 1;
       if (runtime.refs > 0) return;
-      if (active === runtime) active = null;
+      if (registry.active === runtime) registry.active = null;
       runtime.handle.close();
     },
   };

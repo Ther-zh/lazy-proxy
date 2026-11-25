@@ -58,23 +58,37 @@ interface ActiveProxyEnv {
   refs: number;
 }
 
-let activeEnv: ActiveProxyEnv | null = null;
+const ENV_REGISTRY_KEY = Symbol.for("lazy-proxy.env-registry");
+
+function envRegistry(): WeakMap<NodeJS.ProcessEnv, ActiveProxyEnv> {
+  const root = globalThis as typeof globalThis & {
+    [ENV_REGISTRY_KEY]?: WeakMap<NodeJS.ProcessEnv, ActiveProxyEnv>;
+  };
+  root[ENV_REGISTRY_KEY] ??= new WeakMap();
+  return root[ENV_REGISTRY_KEY];
+}
 
 /**
  * 引用计数的 env 注入：V2 会按 location 多次调用 setup，任一实例 dispose 时
  * 不能把其他实例仍在使用的代理 env 提前清掉。最后一个 handle restore 时才恢复原值。
  */
 export function acquireProxyEnv(port: number, env: NodeJS.ProcessEnv = process.env): ProxyEnvHandle {
+  const registry = envRegistry();
+  const activeEnv = registry.get(env);
   if (activeEnv && activeEnv.handle.proxyUrl === `http://127.0.0.1:${port}`) {
     activeEnv.refs += 1;
-    return consumerEnvHandle(activeEnv);
+    return consumerEnvHandle(registry, env, activeEnv);
   }
   const state: ActiveProxyEnv = { handle: injectProxyEnv(port, env), refs: 1 };
-  activeEnv = state;
-  return consumerEnvHandle(state);
+  registry.set(env, state);
+  return consumerEnvHandle(registry, env, state);
 }
 
-function consumerEnvHandle(state: ActiveProxyEnv): ProxyEnvHandle {
+function consumerEnvHandle(
+  registry: WeakMap<NodeJS.ProcessEnv, ActiveProxyEnv>,
+  env: NodeJS.ProcessEnv,
+  state: ActiveProxyEnv,
+): ProxyEnvHandle {
   let released = false;
   return {
     proxyUrl: state.handle.proxyUrl,
@@ -83,7 +97,7 @@ function consumerEnvHandle(state: ActiveProxyEnv): ProxyEnvHandle {
       released = true;
       state.refs -= 1;
       if (state.refs > 0) return;
-      if (activeEnv === state) activeEnv = null;
+      if (registry.get(env) === state) registry.delete(env);
       state.handle.restore();
     },
   };

@@ -2,9 +2,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { connect as netConnect, createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin, { LazyProxyPlugin } from "../../src/plugin/index";
 import { resolveConfigDir, startLazyProxy } from "../../src/plugin/runtime";
+
+type SetupCleanup = Exclude<Awaited<ReturnType<typeof plugin.setup>>, void>;
 
 const ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"] as const;
 const savedEnv = new Map<string, string | undefined>();
@@ -163,6 +165,78 @@ describe("plugin entry", () => {
     expect(process.env.HTTPS_PROXY).toBeUndefined();
     expect(globalThis.fetch).toBe(origFetch);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps the shim alive when a reloaded module attaches to it", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen });
+    let firstCleanup: SetupCleanup | undefined;
+    let secondCleanup: SetupCleanup | undefined;
+    let listeningAfterFirstCleanup = false;
+    let proxyAfterFirstCleanup: string | undefined;
+    let proxyAfterAllCleanups: string | undefined;
+
+    try {
+      vi.resetModules();
+      const firstPlugin = (await import("../../src/plugin/index")).default;
+      const first = await withConfigDir(dir, () => firstPlugin.setup({} as never));
+      if (typeof first === "function") firstCleanup = first;
+
+      vi.resetModules();
+      const reloadedPlugin = (await import("../../src/plugin/index")).default;
+      const second = await withConfigDir(dir, () => reloadedPlugin.setup({} as never));
+      if (typeof second === "function") secondCleanup = second;
+
+      await firstCleanup?.();
+      listeningAfterFirstCleanup = await isPortOpen(chosen);
+      proxyAfterFirstCleanup = process.env.HTTPS_PROXY;
+      await secondCleanup?.();
+      proxyAfterAllCleanups = process.env.HTTPS_PROXY;
+    } finally {
+      await secondCleanup?.();
+      await firstCleanup?.();
+      vi.resetModules();
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(listeningAfterFirstCleanup).toBe(true);
+    expect(proxyAfterFirstCleanup).toBe(`http://127.0.0.1:${chosen}`);
+    expect(proxyAfterAllCleanups).toBeUndefined();
+  });
+
+  it("shares the startup promise across concurrent setup calls", async () => {
+    saveEnv();
+    clearProxyEnv();
+    const chosen = await freePort();
+    const dir = tempDirWithConfig({ shimPort: chosen });
+    let cleanups: Array<SetupCleanup | void> = [];
+    let listeningAfterFirstCleanup = false;
+    let proxyAfterFirstCleanup: string | undefined;
+    let proxyAfterAllCleanups: string | undefined;
+
+    try {
+      cleanups = await withConfigDir(dir, async () =>
+        Promise.all([
+          plugin.setup({} as never),
+          plugin.setup({} as never),
+        ]),
+      );
+      expect(cleanups.every((cleanup) => typeof cleanup === "function")).toBe(true);
+      await cleanups[0]?.();
+      listeningAfterFirstCleanup = await isPortOpen(chosen);
+      proxyAfterFirstCleanup = process.env.HTTPS_PROXY;
+      await cleanups[1]?.();
+      proxyAfterAllCleanups = process.env.HTTPS_PROXY;
+    } finally {
+      for (const cleanup of cleanups) await cleanup?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(listeningAfterFirstCleanup).toBe(true);
+    expect(proxyAfterFirstCleanup).toBe(`http://127.0.0.1:${chosen}`);
+    expect(proxyAfterAllCleanups).toBeUndefined();
   });
 
   it("resolveConfigDir honors env override", () => {
