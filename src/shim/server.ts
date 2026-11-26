@@ -250,11 +250,16 @@ async function handleConnect(
   };
 
   coreSock.on("error", (e) => fail(e.message));
-  coreSock.on("close", () => {
+  coreSock.on("close", (hadError) => {
     clearConnectTimer();
     if (!established) fail("closed before tunnel established");
     else {
-      if (!clientSocket.destroyed) clientSocket.destroy();
+      if (!clientSocket.destroyed) {
+        // 正常 EOF 时让 end() 排空待发送数据；立即 destroy() 会丢弃
+        // Bun HTTP CONNECT socket 尚未写完的 TLS/响应尾部。
+        if (!hadError && !failed && coreSock.readableEnded) clientSocket.end();
+        else clientSocket.destroy();
+      }
       endOnce();
     }
   });

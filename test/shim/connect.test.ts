@@ -1,5 +1,5 @@
-import { connect as netConnect, createServer as createTcpServer, type Socket } from "node:net";
-import { describe, expect, it } from "vitest";
+import { connect as netConnect, createServer as createTcpServer, Socket } from "node:net";
+import { describe, expect, it, vi } from "vitest";
 import { effectiveProxyHosts, isProxyHost, startShimServer } from "../../src/shim/server";
 import { CoreManager } from "../../src/core/manager";
 import { DEFAULTS, type LazyProxyConfig } from "../../src/config/schema";
@@ -267,6 +267,78 @@ describe("CONNECT tunneling", () => {
     t.socket.destroy();
     shim.close();
     misbehaving.stop();
+  });
+
+  it("flushes pending client writes when the core ends the tunnel gracefully", async () => {
+    const payload = Buffer.alloc(256 * 1024, 0x5a);
+    const sockets = new Set<Socket>();
+    const coreProxy = createTcpServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      socket.on("error", () => {});
+      let headers = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        headers = Buffer.concat([headers, chunk]);
+        if (headers.indexOf("\r\n\r\n") < 0) return;
+        socket.removeListener("data", onData);
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        socket.end(payload);
+      };
+      socket.on("data", onData);
+    });
+    await new Promise<void>((resolve) => coreProxy.listen(0, "127.0.0.1", resolve));
+    const core = readyCore();
+    core.ensureUp = async () => {};
+    const corePort = (coreProxy.address() as { port: number }).port;
+    const shim = await startShimServer(cfgOf({ corePort }), core);
+
+    // Hold writes only on this shim's client socket. This makes the real TCP
+    // backpressure race deterministic without changing any tunnel events.
+    const originalPipe = Socket.prototype.pipe;
+    const pipeSpy = vi.spyOn(Socket.prototype, "pipe").mockImplementation(function <T extends NodeJS.WritableStream>(
+      this: Socket,
+      destination: T,
+      options?: { end?: boolean },
+    ): T {
+      if (this.remotePort === corePort && (destination as unknown as Socket).localPort === shim.port) {
+        // Bun's HTTP CONNECT socket has its own _write implementation, so
+        // delay this actual instance rather than the net.Socket prototype.
+        const downstream = destination as unknown as Socket;
+        const write = downstream._write;
+        downstream._write = function (...args: Parameters<typeof write>) {
+          setTimeout(() => write.apply(this, args), 30);
+        };
+        const writev = downstream._writev;
+        if (writev) downstream._writev = function (...args: Parameters<typeof writev>) {
+          setTimeout(() => writev.apply(this, args), 30);
+        };
+      }
+      return originalPipe.call(this, destination, options) as T;
+    });
+    let client: Socket | undefined;
+    try {
+      const tunnel = await connectTunnel(shim.port, "chatgpt.com:443");
+      client = tunnel.socket;
+      expect(tunnel.status).toBe(200);
+      const received = await new Promise<Buffer>((resolve, reject) => {
+        const chunks = [tunnel.rest];
+        const timer = setTimeout(() => reject(new Error("tunnel did not close")), 3000);
+        client!.on("data", (chunk: Buffer) => chunks.push(chunk));
+        client!.once("error", reject);
+        client!.once("close", () => {
+          clearTimeout(timer);
+          resolve(Buffer.concat(chunks));
+        });
+      });
+      expect(received.length).toBe(payload.length);
+      expect(received.equals(payload)).toBe(true);
+    } finally {
+      pipeSpy.mockRestore();
+      client?.destroy();
+      shim.close();
+      for (const socket of sockets) socket.destroy();
+      coreProxy.close();
+    }
   });
 
   it("returns 502 when the core never answers CONNECT (timeout)", async () => {
