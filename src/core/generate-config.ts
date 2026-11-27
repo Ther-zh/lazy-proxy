@@ -179,6 +179,8 @@ export function buildMihomoConfig(
     "bind-address": "127.0.0.1",
     mode: "rule",
     "log-level": "warning",
+    "keep-alive-idle": 15,
+    "keep-alive-interval": 15,
     proxies: usable,
     "proxy-groups": proxyGroups,
     rules: ["MATCH,PROXY"],

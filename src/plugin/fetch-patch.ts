@@ -116,10 +116,13 @@ function makePatchedFetch(state: PatchState): typeof fetch {
     if (!isProxyHost(url.hostname, state.opts.hosts)) return state.originalFetch(input, init);
 
     if (hasBun()) {
-      // Bun 原生 fetch 支持 { proxy }，直接复用其 CONNECT/TLS 实现
+      // Bun 原生 fetch 支持 { proxy }；默认禁用连接池复用（与下方 Node 分支 keepAlive: false 一致），
+      // 避免跨轮次复用即将满 ~60s 空闲被代理节点/NAT 回收的半死连接导致 ECONNRESET。
+      const rawInit = init as Record<string, unknown> | undefined;
       const proxiedInit = {
-        ...(init as Record<string, unknown> | undefined),
+        ...rawInit,
         proxy: `http://127.0.0.1:${state.opts.shimPort}`,
+        keepalive: typeof rawInit?.keepalive === "boolean" ? rawInit.keepalive : false,
       };
       return state.originalFetch(input, proxiedInit as RequestInit);
     }

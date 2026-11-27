@@ -76,6 +76,8 @@ describe("buildMihomoConfig", () => {
     expect(doc["mixed-port"]).toBe(17890);
     expect(doc["bind-address"]).toBe("127.0.0.1");
     expect(doc.mode).toBe("rule");
+    expect(doc["keep-alive-idle"]).toBe(15);
+    expect(doc["keep-alive-interval"]).toBe(15);
     expect(doc.rules).toEqual(["MATCH,PROXY"]);
     const groups = doc["proxy-groups"] as Array<Record<string, unknown>>;
     expect(groups.map((g) => g.name)).toEqual(["PROXY", "AUTO"]);

@@ -341,4 +341,46 @@ describe("installFetchPatch", () => {
     h2.restore();
     expect(scope.fetch).toBe(orig.fetch);
   });
+
+  it("in Bun runtime, defaults proxied requests to keepalive: false while preserving explicit keepalive", async () => {
+    const g = globalThis as Record<string, unknown>;
+    const hadBun = "Bun" in g;
+    const prevBun = g.Bun;
+    g.Bun = {};
+    try {
+      const orig = markerFetch();
+      const scope: FetchScope = { fetch: orig.fetch };
+      const patch = installFetchPatch({ shimPort: 17891, hosts: ["daily-cloudcode-pa.googleapis.com"], scope });
+      cleanups.push(patch.restore);
+
+      await scope.fetch!("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
+        method: "POST",
+        body: "{}",
+      });
+      await scope.fetch!("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
+        method: "POST",
+        body: "{}",
+        keepalive: true,
+      });
+      await scope.fetch!("https://api.deepseek.com/v1/chat/completions", { method: "POST" });
+
+      expect(orig.calls).toHaveLength(3);
+      const [, firstInit] = orig.calls[0] as [unknown, Record<string, unknown>];
+      expect(firstInit).toMatchObject({
+        proxy: "http://127.0.0.1:17891",
+        keepalive: false,
+      });
+      const [, secondInit] = orig.calls[1] as [unknown, Record<string, unknown>];
+      expect(secondInit).toMatchObject({
+        proxy: "http://127.0.0.1:17891",
+        keepalive: true,
+      });
+      const [, thirdInit] = orig.calls[2] as [unknown, Record<string, unknown> | undefined];
+      expect(thirdInit?.proxy).toBeUndefined();
+      expect(thirdInit?.keepalive).toBeUndefined();
+    } finally {
+      if (hadBun) g.Bun = prevBun;
+      else delete g.Bun;
+    }
+  });
 });
